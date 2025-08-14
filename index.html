@@ -1,5 +1,5 @@
-<!DOCTYPE html> 
-<html lang="en">
+<!DOCTYPE html>
+<html lang="en" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -8,135 +8,146 @@
   <link rel="apple-touch-icon" href="icon.png">
   <meta name="theme-color" content="#000000">
   <meta name="description" content="P2P Bio-Vault for True Value of Money">
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: {} }
+    }
+  </script>
   <style>
-    /* Basic styling for responsiveness and accessibility */
-    body { font-family: Arial, sans-serif; background: #f4f4f4; color: #333; }
-    .hidden { display: none; }
-    input, button { margin: 5px; padding: 10px; font-size: 16px; }
-    .modal { position: fixed; top: 20%; left: 20%; width: 60%; background: white; padding: 20px; border: 1px solid black; z-index: 100; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; }
-    .loading { display: none; } /* For progress indicators */
-    @media (max-width: 600px) { .modal { left: 5%; width: 90%; } }
-    /* High contrast mode */
-    @media (prefers-contrast: high) { body { background: #fff; color: #000; } }
-    /* Reduced motion */
-    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+    .spinner { border: 4px solid rgba(0,0,0,0.1); border-left-color: #000; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: #fff; padding: 10px 20px; border-radius: 5px; z-index: 200; display: none; }
+    :focus { outline: 2px solid #000; }
   </style>
 </head>
-<body>
-  <h1>Bio-Vault</h1>
-  <p>WELCOME TO YOUR VAULT WHERE THE TRUE VALUE OF MONEY IS.</p>
+<body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100 flex flex-col min-h-screen">
+  <header class="p-4 text-center">
+    <h1 class="text-2xl font-bold">Bio-Vault</h1>
+    <p>WELCOME TO YOUR VAULT WHERE THE TRUE VALUE OF MONEY IS.</p>
+  </header>
 
-  <div id="lockedScreen">
-    <button id="enterVaultBtn">Enter Vault</button>
-    <div id="passphraseModal" class="hidden">
-      <label for="passphrase">Enter Passphrase:</label>
-      <input type="password" id="passphrase">
-      <button id="savePassphraseBtn">Save</button>
-      <button id="cancelPassphraseBtn">Cancel</button>
-    </div>
-  </div>
+  <main class="flex-grow p-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+    <section id="lockedScreen" aria-labelledby="locked-title">
+      <h2 id="locked-title" class="sr-only">Locked Vault</h2>
+      <button id="enterVaultBtn" class="bg-black text-white px-4 py-2 rounded w-full" aria-label="Enter Vault">Enter Vault</button>
+    </section>
 
-  <div id="vaultUI" class="hidden">
-    <p>Your Bio-IBAN: <span id="bioIban"></span> <button id="copyIbanBtn">Copy</button></p>
-    <p>Balance: <span id="balanceTVM"></span> TVM (<span id="sheMetrics"></span> SHE)</p>
-    <p>Equivalent to <span id="balanceUSD"></span> USD</p>
-    <p>BonusConstant: <span id="bonusConstant"></span></p>
-    <p>UTC Time: <span id="utcTime"></span></p>
-    <p>On-Chain Wallet Address: <span id="walletAddress"></span></p>
-    <button id="saveWalletBtn">Save Wallet</button>
-    <button id="connectMetaMaskBtn">Connect MetaMask</button>
-    <button id="connectWalletConnectBtn">Connect WalletConnect</button>
+    <section id="vaultUI" class="hidden flex flex-col gap-4" aria-labelledby="vault-title">
+      <h2 id="vault-title" class="sr-only">Vault Dashboard</h2>
+      <div class="flex justify-between items-center">
+        <p>Your Bio-IBAN: <span id="bioIban"></span></p>
+        <button id="copyIbanBtn" class="bg-gray-200 dark:bg-gray-700 px-2 py-1 rounded" aria-label="Copy Bio-IBAN">Copy</button>
+      </div>
+      <p>Balance: <span id="balanceTVM"></span> TVM (<span id="sheMetrics"></span> SHE)</p>
+      <p>Equivalent to <span id="balanceUSD"></span> USD</p>
+      <p>BonusConstant: <span id="bonusConstant"></span></p>
+      <p>UTC Time: <span id="utcTime"></span></p>
+      <p>On-Chain Wallet Address: <span id="walletAddress"></span></p>
+      <button id="saveWalletBtn" class="bg-blue-500 text-white px-4 py-2 rounded" aria-label="Save Wallet">Save Wallet</button>
+      <div class="grid grid-cols-2 gap-2">
+        <button id="connectMetaMaskBtn" class="bg-green-500 text-white px-4 py-2 rounded" aria-label="Connect MetaMask">Connect MetaMask</button>
+        <button id="connectWalletConnectBtn" class="bg-green-500 text-white px-4 py-2 rounded" aria-label="Connect WalletConnect">Connect WalletConnect</button>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <button id="catchInBtn" class="bg-purple-500 text-white px-4 py-2 rounded" aria-label="Catch In">Catch In</button>
+        <button id="catchOutBtn" class="bg-purple-500 text-white px-4 py-2 rounded" aria-label="Catch Out">Catch Out</button>
+      </div>
+      <div id="transactionHistory" class="overflow-auto" aria-labelledby="history-title">
+        <h2 id="history-title">Transaction History</h2>
+        <table id="txTable" class="w-full border-collapse" aria-describedby="history-title">
+          <thead>
+            <tr class="bg-gray-200 dark:bg-gray-700">
+              <th class="border p-2">Bio-IBAN</th>
+              <th class="border p-2">Bio-Catch</th>
+              <th class="border p-2">Amount (TVM)</th>
+              <th class="border p-2">Date/Time</th>
+              <th class="border p-2">Status</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="grid grid-cols-3 gap-2 mt-2">
+          <button id="exportTxBtn" class="bg-yellow-500 text-white px-4 py-2 rounded" aria-label="Export Transactions">Export Transactions</button>
+          <button id="backupVaultBtn" class="bg-yellow-500 text-white px-4 py-2 rounded" aria-label="Backup Vault">Backup Vault</button>
+          <button id="exportFriendlyBackupBtn" class="bg-yellow-500 text-white px-4 py-2 rounded" aria-label="Export Friendly Backup">Export Friendly Backup</button>
+        </div>
+        <label for="importVaultInput" class="block mt-2">Import .vault file</label>
+        <input type="file" id="importVaultInput" class="border p-2 w-full dark:border-gray-600" aria-label="Import .vault file">
+        <button id="importVaultBtn" class="bg-yellow-500 text-white px-4 py-2 rounded mt-2 w-full" aria-label="Import .vault">Import .vault</button>
+      </div>
+      <p class="text-center">(Exchange Rate: 1 USD = 12 TVM)</p>
+      <div class="grid grid-cols-2 gap-2">
+        <button id="lockVaultBtn" class="bg-red-500 text-white px-4 py-2 rounded" aria-label="Lock Vault">Lock Vault</button>
+        <button id="terminateVaultBtn" class="bg-red-500 text-white px-4 py-2 rounded" aria-label="Terminate Vault">Terminate Vault</button>
+      </div>
+    </section>
 
-    <div>
-      <button id="catchInBtn">Catch In</button>
-      <button id="catchOutBtn">Catch Out</button>
-    </div>
+    <dialog id="bioCatchModal" class="p-4 bg-white dark:bg-gray-800 rounded shadow-lg w-full max-w-md" aria-modal="true" aria-labelledby="biocatch-title">
+      <h2 id="biocatch-title" class="text-xl">Your Bio-Catch Number</h2>
+      <p id="bioCatchText" class="my-2"></p>
+      <button id="copyBioCatchBtn" class="bg-blue-500 text-white px-4 py-2 rounded" aria-label="Copy Bio-Catch">Copy Bio-Catch</button>
+      <button id="closeBioCatchBtn" class="bg-gray-500 text-white px-4 py-2 rounded ml-2" aria-label="Close Bio-Catch Modal">Close</button>
+      <div id="qrCode" class="my-2"></div>
+      <button id="shareNfcBtn" class="bg-green-500 text-white px-4 py-2 rounded mt-2" aria-label="Share via NFC">Share via NFC</button>
+    </dialog>
 
-    <div id="transactionHistory">
-      <h2>Transaction History</h2>
-      <table id="txTable">
-        <thead>
-          <tr>
-            <th>Bio-IBAN</th>
-            <th>Bio-Catch</th>
-            <th>Amount (TVM)</th>
-            <th>Date/Time</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <button id="exportTxBtn">Export Transactions</button>
-      <button id="backupVaultBtn">Backup Vault</button>
-      <button id="exportFriendlyBackupBtn">Export Friendly Backup</button>
-      <input type="file" id="importVaultInput">
-      <button id="importVaultBtn">Import .vault</button>
-    </div>
+    <section id="tvmInteraction" class="flex flex-col gap-4" aria-labelledby="tvm-title">
+      <h2 id="tvm-title" class="text-xl">TVM Token Interaction</h2>
+      <p>Connected Account: <span id="connectedAccount"></span></p>
+      <p>TVM Balance: <span id="tvmBalance"></span></p>
+      <p>USDT Balance: <span id="usdtBalance"></span></p>
+      <p>Current TVM Price (in USDT base units): <span id="tvmPrice"></span></p>
 
-    <p>(Exchange Rate: 1 USD = 12 TVM)</p>
+      <article aria-labelledby="claim-title" class="flex flex-col gap-2">
+        <h3 id="claim-title">Claim TVM</h3>
+        <label for="claim-proofs" class="block">Proofs (JSON array)</label>
+        <input id="claim-proofs" class="border p-2 w-full dark:border-gray-600">
+        <label for="claim-device-key-hash" class="block">Device Key Hash (bytes32 hex)</label>
+        <input id="claim-device-key-hash" class="border p-2 w-full dark:border-gray-600">
+        <label for="claim-user-bio-constant" class="block">User Bio Constant (uint256)</label>
+        <input id="claim-user-bio-constant" class="border p-2 w-full dark:border-gray-600">
+        <label for="claim-nonce" class="block">Nonce (uint256)</label>
+        <input id="claim-nonce" class="border p-2 w-full dark:border-gray-600">
+        <button id="generate-claim-signature-btn" class="bg-blue-500 text-white px-4 py-2 rounded" aria-label="Generate Claim Signature">Generate Signature</button>
+        <label for="claim-signature" class="block">Signature (hex)</label>
+        <input id="claim-signature" class="border p-2 w-full dark:border-gray-600" readonly>
+        <button id="claim-tvm-btn" class="bg-green-500 text-white px-4 py-2 rounded" aria-label="Claim TVM">Claim TVM</button>
+        <div id="claim-loading" class="spinner hidden mx-auto"></div>
+        <meter id="she-meter" value="0" max="100" class="w-full h-2" aria-label="SHE Effort Meter"></meter>
+      </article>
 
-    <button id="lockVaultBtn">Lock Vault</button>
-    <button id="terminateVaultBtn">Terminate Vault</button>
-  </div>
+      <!-- Similar structure for other sections with improved grid/flex for responsiveness -->
 
-  <div id="bioCatchModal" class="hidden modal">
-    <h2>Your Bio-Catch Number</h2>
-    <p id="bioCatchText"></p>
-    <button id="copyBioCatchBtn">Copy Bio-Catch</button>
-    <button id="closeBioCatchBtn">Close</button>
-    <div id="qrCode"></div>
-    <button id="shareNfcBtn">Share via NFC</button>
-  </div>
+    </section>
+  </main>
 
-  <div id="tvmInteraction">
-    <h2>TVM Token Interaction</h2>
-    <p>Connected Account: <span id="connectedAccount"></span></p>
-    <p>TVM Balance: <span id="tvmBalance"></span></p>
-    <p>USDT Balance: <span id="usdtBalance"></span></p>
-    <p>Current TVM Price (in USDT base units): <span id="tvmPrice"></span></p>
-
-    <h3>Claim TVM</h3>
-    <input id="claim-proofs" placeholder="Proofs (JSON array)">
-    <input id="claim-device-key-hash" placeholder="Device Key Hash (bytes32 hex)">
-    <input id="claim-user-bio-constant" placeholder="User Bio Constant (uint256)">
-    <input id="claim-nonce" placeholder="Nonce (uint256)">
-    <button id="generate-claim-signature-btn">Generate Signature</button>
-    <input id="claim-signature" placeholder="Signature (hex)" readonly>
-    <button id="claim-tvm-btn">Claim TVM</button>
-    <div id="claim-loading" class="loading">Processing...</div>
-
-    <h3>Exchange TVM for Segments</h3>
-    <input id="exchange-amount" placeholder="Amount (whole TVM)">
-    <input id="exchange-device-key-hash" placeholder="Device Key Hash (bytes32 hex)">
-    <input id="exchange-proofs" placeholder="Proofs (JSON array)">
-    <input id="exchange-user-bio-constant" placeholder="User Bio Constant (uint256)">
-    <input id="exchange-nonce" placeholder="Nonce (uint256)">
-    <button id="generate-exchange-signature-btn">Generate Signature</button>
-    <input id="exchange-signature" placeholder="Signature (hex)" readonly>
-    <button id="exchange-tvm-btn">Exchange TVM</button>
-    <div id="exchange-loading" class="loading">Processing...</div>
-
-    <h3>Swap TVM for USDT</h3>
-    <input id="swap-tvm-amount" placeholder="Amount (whole TVM)">
-    <input id="swap-tvm-layer" placeholder="Layer (1-4)">
-    <button id="swap-tvm-usdt-btn">Swap TVM for USDT</button>
-
-    <h3>Swap USDT for TVM</h3>
-    <input id="swap-usdt-amount" placeholder="Amount (whole TVM to receive)">
-    <input id="swap-usdt-layer" placeholder="Layer (1-4)">
-    <button id="swap-usdt-tvm-btn">Swap USDT for TVM</button>
-
-    <h3>Transfer TVM</h3>
-    <input id="transfer-to" placeholder="To Address">
-    <input id="transfer-amount" placeholder="Amount (whole TVM)">
-    <button id="transfer-btn">Transfer</button>
-  </div>
-
-  <footer>
+  <footer class="p-4 text-center bg-gray-200 dark:bg-gray-800">
     <p>By RR.R — for Humanity</p>
   </footer>
+
+  <div id="toast" class="toast"></div>
+  <dialog id="customPromptModal" class="p-4 bg-white dark:bg-gray-800 rounded shadow-lg w-full max-w-md" aria-modal="true">
+    <form method="dialog">
+      <label id="promptLabel" class="block mb-2"></label>
+      <input id="promptInput" type="text" class="border p-2 w-full dark:border-gray-600 mb-2">
+      <div class="flex gap-2">
+        <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded flex-1">Submit</button>
+        <button type="button" id="cancelPromptBtn" class="bg-gray-500 text-white px-4 py-2 rounded flex-1">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirmModal" class="p-4 bg-white dark:bg-gray-800 rounded shadow-lg w-full max-w-md" aria-modal="true" aria-labelledby="confirm-title">
+    <h2 id="confirm-title" class="text-xl mb-2">Confirmation</h2>
+    <p id="confirmMessage" class="mb-4"></p>
+    <div class="flex gap-2">
+      <button id="confirmYesBtn" class="bg-green-500 text-white px-4 py-2 rounded flex-1">Yes</button>
+      <button id="confirmNoBtn" class="bg-red-500 text-white px-4 py-2 rounded flex-1">No</button>
+    </div>
+  </dialog>
 
   <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.min.js"></script>
   <script src="https://unpkg.com/@walletconnect/ethereum-provider@2.15.2/dist/umd/index.min.js"></script>
