@@ -1,1362 +1,775 @@
-/* balance_chain_v3.js – Ultimate Production-Grade BalanceChain (July 2025) */
-/* eslint max-lines: 1500 */
-/* eslint-disable no-console */
-"use strict";
+// main.js
+/******************************
+ * Base Setup / Global Constants
+ ******************************/
+const DB_NAME = 'BioVaultDB';
+const DB_VERSION = 2; // Updated for additional stores if needed
+const VAULT_STORE = 'vault';
+const PROOFS_STORE = 'proofs';
 
-/*──────────────────────── 1. CONSTANTS ───────────────────────────────*/
-const GENESIS_TIMESTAMP = 1577836800; // Jan 1, 2020, 00:00:00 UTC
-const Protocol = Object.freeze({
-  GENESIS_BIO_CONST: GENESIS_TIMESTAMP,
-  SEGMENTS: Object.freeze({
-    TOTAL: 12000,
-    UNLOCKED_INIT: 1200,
-    PER_DAY: 3,
-    PER_MONTH: 30,
-    PER_YEAR: 90
-  }),
-  TVM: Object.freeze({
-    SEGMENTS_PER_TOKEN: 12,
-    CLAIM_CAP: 1000,
-    EXCHANGE_RATE: 12 // 1 USD = 12 SHE
-  }),
-  HISTORY_MAX: 20,
-  BONUS: Object.freeze({
-    PER_TX: 120,
-    MAX_PER_DAY: 3,
-    MAX_PER_MONTH: 30,
-    MAX_ANNUAL_TVM: 10800,
-    MIN_SEND_AMOUNT: 240
-  })
-});
-
-const Limits = Object.freeze({
-  AUTH: Object.freeze({ MAX_ATTEMPTS: 5, LOCKOUT_SECONDS: 3600 }),
-  PAGE: Object.freeze({ DEFAULT_SIZE: 10 }),
-  TRANSACTION_VALIDITY_SECONDS: 720,
-  BATCH_SIZE: 10000
-});
-
-const DB = Object.freeze({
-  NAME: "BalanceChainVaultDB",
-  VERSION: 4,
-  STORE: "vaultStore",
-  BACKUP_KEY: "vaultArmoredBackup",
-  STORAGE_CHECK_INTERVAL: 300000
-});
-
-const vaultSyncChannel = new BroadcastChannel("vault-sync");
+// Vault & Bonus Limits
+const INITIAL_BALANCE_SHE = 1200;
+const EXCHANGE_RATE = 12; // 1 TVM = 12 SHE
+const INITIAL_BIO_CONSTANT = 1736565605;
+const LOCKOUT_DURATION_SECONDS = 3600;
+const MAX_AUTH_ATTEMPTS = 3;
+const CONTRACT_ADDRESS = '0xCc79b1BC9eAbc3d30a3800f4d41a4A0599e1F3c6';
+const USDT_ADDRESS = '0xdac17f958d2ee523a2206206994597c13d831ec7';
+const ABI = [ /* Same ABI as before, omitted for brevity */ ];
+const GENESIS_BIO_CONSTANT = 1736565605;
+const BIO_TOLERANCE = 720;
+const BIO_STEP = 1;
+const SEGMENTS_PER_LAYER = 1200;
+const LAYERS = 10;
+const DECIMALS_FACTOR = 1000000;
+const SEGMENTS_PER_TVM = 12;
+const DAILY_CAP_TVM = 30;
+const MONTHLY_CAP_TVM = 300;
+const YEARLY_CAP_TVM = 900;
+const EXTRA_BONUS_TVM = 100;
+const MAX_PROOFS_LENGTH = 200;
+const SEGMENT_PROOF_TYPEHASH = ethers.keccak256(ethers.toUtf8Bytes("SegmentProof(uint256 segmentIndex,uint256 currentBioConst,bytes32 ownershipProof,bytes32 unlockIntegrityProof,bytes32 spentProof,uint256 ownershipChangeCount,bytes32 biometricZKP)"));
+const CLAIM_TYPEHASH = ethers.keccak256(ethers.toUtf8Bytes("Claim(address user,bytes32 proofsHash,bytes32 deviceKeyHash,uint256 userBioConstant,uint256 nonce)"));
+const HISTORY_MAX = 20;
 const KEY_HASH_SALT = "Balance-Chain-v3-PRD";
 const PBKDF2_ITERS = 310000;
 const AES_KEY_LENGTH = 256;
-const MAX_IDLE = 15 * 60 * 1000; // 15 minutes
+const MAX_IDLE = 15 * 60 * 1000;
+const HMAC_KEY = new TextEncoder().encode("BalanceChainHMACSecret");
+const VAULT_BACKUP_KEY = 'vaultArmoredBackup';
+const STORAGE_CHECK_INTERVAL = 300000;
+const vaultSyncChannel = new BroadcastChannel('vault-sync');
+const WALLET_CONNECT_PROJECT_ID = 'your_project_id_here'; // Replace with actual ID
 
-/*──────────────────────── 2. UTILS / HELPERS ─────────────────────────*/
-const enc = new TextEncoder(), dec = new TextDecoder();
-const toB64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
-const fromB64 = b64 => Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
-const rand = len => crypto.getRandomValues(new Uint8Array(len));
+// State
+let vaultUnlocked = false;
+let derivedKey = null;
+let bioLineIntervalTimer = null;
+let provider = null;
+let signer = null;
+let tvmContract = null;
+let usdtContract = null;
+let account = null;
+let chainId = null;
 
-const ctEq = (a = "", b = "") => {
-  if (a.length !== b.length) return false;
-  let res = 0;
-  for (let i = 0; i < a.length; i++) res |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return res === 0;
+let vaultData = {
+  bioIBAN: null,
+  initialBioConstant: INITIAL_BIO_CONSTANT,
+  bonusConstant: 0,
+  initialBalanceSHE: INITIAL_BALANCE_SHE,
+  balanceSHE: 0,
+  balanceUSD: 0,
+  lastUTCTimestamp: 0,
+  transactions: [],
+  authAttempts: 0,
+  lockoutTimestamp: null,
+  joinTimestamp: 0,
+  credentialId: null,
+  userWallet: "",
+  deviceKeyHash: "",
+  layerBalances: Array.from({length: LAYERS}, () => 0)
 };
 
-const canonical = obj => JSON.stringify(obj, Object.keys(obj).sort());
+vaultData.layerBalances[0] = INITIAL_BALANCE_SHE;
 
-const sha256 = async data => {
-  const buf = await crypto.subtle.digest("SHA-256", typeof data === "string" ? enc.encode(data) : data);
-  return toB64(buf);
+// Utils Module
+const Utils = {
+  enc: new TextEncoder(),
+  dec: new TextDecoder(),
+  toB64: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))),
+  fromB64: (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer,
+  rand: (len) => crypto.getRandomValues(new Uint8Array(len)),
+  ctEq: (a = "", b = "") => {
+    if (a.length !== b.length) return false;
+    let res = 0;
+    for (let i = 0; i < a.length; i++) res |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return res === 0;
+  },
+  canonical: (obj) => JSON.stringify(obj, Object.keys(obj).sort()),
+  sha256: async (data) => {
+    const buf = await crypto.subtle.digest("SHA-256", typeof data === "string" ? Utils.enc.encode(data) : data);
+    return Utils.toB64(buf);
+  },
+  sha256Hex: async (str) => {
+    const buf = await crypto.subtle.digest("SHA-256", Utils.enc.encode(str));
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+  },
+  hmacSha256: async (message) => {
+    const key = await crypto.subtle.importKey("raw", HMAC_KEY, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const signature = await crypto.subtle.sign("HMAC", key, Utils.enc.encode(message));
+    return Utils.toB64(signature);
+  },
+  sanitizeInput: (input) => DOMPurify.sanitize(input)
 };
 
-const sha256Hex = async str => {
-  const buf = await crypto.subtle.digest("SHA-256", enc.encode(str));
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+// Encryption Module
+const Encryption = {
+  encryptData: async (key, dataObj) => {
+    const iv = Utils.rand(12);
+    const plaintext = Utils.enc.encode(JSON.stringify(dataObj));
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
+    return { iv, ciphertext };
+  },
+  decryptData: async (key, iv, ciphertext) => {
+    const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+    return JSON.parse(Utils.dec.decode(plainBuf));
+  },
+  bufferToBase64: (buf) => Utils.toB64(buf),
+  base64ToBuffer: (b64) => Utils.fromB64(b64)
 };
 
-/*──────────────────────── 3. CRYPTO SERVICE ──────────────────────────*/
-class CryptoService {
-  static async deriveKey(pin, salt) {
-    const mat = await crypto.subtle.importKey("raw", enc.encode(pin), "PBKDF2", false, ["deriveKey"]);
-    return crypto.subtle.deriveKey(
-      { name: "PBKDF2", salt, iterations: PBKDF2_ITERS, hash: "SHA-256" },
-      mat, { name: "AES-GCM", length: AES_KEY_LENGTH }, false, ["encrypt", "decrypt"]
-    );
-  }
-
-  static async encrypt(key, obj) {
-    const iv = rand(12);
-    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(obj)));
-    return { iv, ct };
-  }
-
-  static async decrypt(key, iv, ct) {
-    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
-    return JSON.parse(dec.decode(pt));
-  }
-
-  static async encryptBioCatchNumber(plainText) {
-    return toB64(enc.encode(plainText));
-  }
-
-  static async decryptBioCatchNumber(encStr) {
-    try { return dec.decode(fromB64(encStr)); } catch { return null; }
-  }
-}
-
-/*──────────────────────── 4. PUBLIC PROOFS ───────────────────────────*/
-const proofHash = (tag, obj) => sha256(`${tag}:${canonical(obj)}`);
-
-const computeUnlockIntegrityProof = seg => proofHash("unlock", {
-  segmentIndex: seg.segmentIndex,
-  currentOwnerKey: seg.currentOwnerKey,
-  currentBioConst: seg.currentBioConst,
-  unlockIndexRef: seg.unlockIndexRef,
-  unlockTriggerBioConst: seg.unlockTriggerBioConst
-});
-
-const computeSpentProof = seg => proofHash("spent", {
-  segmentIndex: seg.segmentIndex,
-  previousOwnerKey: seg.previousOwnerKey,
-  previousBioConst: seg.previousBioConst,
-  currentOwnerKey: seg.currentOwnerKey,
-  currentBioConst: seg.currentBioConst
-});
-
-const computeOwnershipProof = seg => proofHash("own", {
-  segmentIndex: seg.segmentIndex,
-  currentOwnerKey: seg.currentOwnerKey,
-  currentBioConst: seg.currentBioConst,
-  ownershipChangeCount: seg.ownershipChangeCount
-});
-
-/*──────────────────────── 5. DEVICE HASH ─────────────────────────────*/
-const hashDeviceKeyWithSalt = (buf, extra = "") =>
-  sha256(new Uint8Array([...enc.encode(KEY_HASH_SALT), ...new Uint8Array(buf), ...enc.encode(extra)]));
-
-/*──────────────────────── 6. TIME-SYNC SERVICE ───────────────────────*/
-class TimeSyncService {
-  static _offset = 0;
-
-  static async sync() {
-    try {
-      const { unixtime } = await fetch("https://worldtimeapi.org/api/ip", { cache: "no-store" }).then(r => r.json());
-      this._offset = unixtime - Math.floor(Date.now() / 1000);
-    } catch { console.warn("⏰ Time-sync failed – using local clock"); }
-  }
-
-  static now() { return Math.floor(Date.now() / 1000) + this._offset; }
-
-  static updateUTCClock() {
-    const el = document.getElementById("utcTime");
-    if (el) el.textContent = `UTC: ${new Date().toUTCString()}`;
-  }
-}
-
-/*──────────────────────── 7. INDEXED-DB LAYER ────────────────────────*/
-class VaultStorage {
-  static _open() {
-    return new Promise((res, rej) => {
-      const req = indexedDB.open(DB.NAME, DB.VERSION);
-      req.onupgradeneeded = e => {
-        const db = e.target.result;
-        if (!db.objectStoreNames.contains(DB.STORE)) {
-          const store = db.createObjectStore(DB.STORE, { keyPath: "id" });
-          store.createIndex("segmentIndex", "segments.segmentIndex", { multiEntry: true });
+// DB Module
+const DB = {
+  openVaultDB: async () => {
+    return new Promise((resolve, reject) => {
+      let req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (evt) => {
+        let db = evt.target.result;
+        if (!db.objectStoreNames.contains(VAULT_STORE)) {
+          db.createObjectStore(VAULT_STORE, { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains(PROOFS_STORE)) {
+          db.createObjectStore(PROOFS_STORE, { keyPath: 'id' });
         }
       };
-      req.onsuccess = () => res(req.result);
-      req.onerror = () => rej(req.error);
+      req.onsuccess = (evt) => resolve(evt.target.result);
+      req.onerror = (evt) => reject(evt.target.error);
     });
-  }
-
-  static async save(iv, ct, saltB64, meta) {
-    const db = await this._open();
-    await new Promise((res, rej) => {
-      const tx = db.transaction(DB.STORE, "readwrite");
-      tx.objectStore(DB.STORE).put({ id: "vaultData", iv: toB64(iv), ciphertext: toB64(ct), salt: saltB64, ...meta });
-      tx.oncomplete = res;
-      tx.onerror = () => rej(tx.error);
+  },
+  saveVaultDataToDB: async (iv, ciphertext, saltBase64) => {
+    const db = await DB.openVaultDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([VAULT_STORE], 'readwrite');
+      const store = tx.objectStore(VAULT_STORE);
+      store.put({
+        id: 'vaultData',
+        iv: Encryption.bufferToBase64(iv),
+        ciphertext: Encryption.bufferToBase64(ciphertext),
+        salt: saltBase64,
+        lockoutTimestamp: vaultData.lockoutTimestamp || null,
+        authAttempts: vaultData.authAttempts || 0
+      });
+      tx.oncomplete = () => resolve();
+      tx.onerror = (err) => reject(err);
     });
-    const backupPayload = { iv: toB64(iv), data: toB64(ct), salt: saltB64, timestamp: Date.now() };
-    localStorage.setItem(DB.BACKUP_KEY, JSON.stringify(backupPayload));
-    vaultSyncChannel.postMessage({ type: "vaultUpdate", payload: backupPayload });
-    if (navigator.storage?.estimate) {
-      const { quota, usage } = await navigator.storage.estimate();
-      if (usage / quota > 0.9) console.warn("⚠️ Storage quota nearing limit");
-    }
-  }
-
-  static async load() {
-    const db = await this._open();
-    return new Promise((res, rej) => {
-      const tx = db.transaction(DB.STORE, "readonly");
-      const rq = tx.objectStore(DB.STORE).get("vaultData");
-      rq.onsuccess = () => {
-        if (!rq.result) return res(null);
-        const r = rq.result;
-        res({ iv: fromB64(r.iv), ciphertext: fromB64(r.ciphertext), salt: fromB64(r.salt), ...r });
+  },
+  loadVaultDataFromDB: async () => {
+    const db = await DB.openVaultDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([VAULT_STORE], 'readonly');
+      const store = tx.objectStore(VAULT_STORE);
+      const getReq = store.get('vaultData');
+      getReq.onsuccess = () => {
+        if (getReq.result) {
+          try {
+            let iv = Encryption.base64ToBuffer(getReq.result.iv);
+            let ciph = Encryption.base64ToBuffer(getReq.result.ciphertext);
+            let s = getReq.result.salt ? Encryption.base64ToBuffer(getReq.result.salt) : null;
+            resolve({
+              iv, ciphertext: ciph, salt: s,
+              lockoutTimestamp: getReq.result.lockoutTimestamp || null,
+              authAttempts: getReq.result.authAttempts || 0
+            });
+          } catch (err) {
+            console.error("Error decoding stored data =>", err);
+            resolve(null);
+          }
+        } else {
+          resolve(null);
+        }
       };
-      rq.onerror = () => rej(rq.error);
+      getReq.onerror = (err) => reject(err);
+    });
+  },
+  saveProofToDB: async (proofId, proofData) => {
+    const db = await DB.openVaultDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([PROOFS_STORE], 'readwrite');
+      const store = tx.objectStore(PROOFS_STORE);
+      store.put({ id: proofId, data: proofData });
+      tx.oncomplete = () => resolve();
+      tx.onerror = (err) => reject(err);
+    });
+  },
+  loadProofFromDB: async (proofId) => {
+    const db = await DB.openVaultDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([PROOFS_STORE], 'readonly');
+      const store = tx.objectStore(PROOFS_STORE);
+      const getReq = store.get(proofId);
+      getReq.onsuccess = () => resolve(getReq.result ? getReq.result.data : null);
+      getReq.onerror = (err) => reject(err);
     });
   }
-}
-
-/*──────────────────────── 8. WEBAUTHN HELPERS ───────────────────────*/
-class WebAuthnService {
-  static async enroll() {
-    if (!navigator.credentials?.create) throw new Error("WebAuthn unsupported");
-    const rp = { name: "BalanceChain", id: location.hostname };
-    const user = { id: rand(16), name: "anon", displayName: "BalanceChain User" };
-    const cred = await navigator.credentials.create({
-      publicKey: {
-        rp, user, challenge: rand(32),
-        pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
-        authenticatorSelection: { userVerification: "required", residentKey: "preferred" },
-        timeout: 60000
-      }
-    });
-    if (!cred) throw new Error("Biometric enrolment cancelled");
-    return cred.rawId;
-  }
-
-  static async assert(credIdB64) {
-    const allow = [{ id: fromB64(credIdB64), type: "public-key" }];
-    const cred = await navigator.credentials.get({
-      publicKey: { allowCredentials: allow, challenge: rand(16), userVerification: "required" },
-      mediation: "optional"
-    });
-    if (!cred) throw new Error("Biometric cancelled");
-    const flags = new DataView(cred.response.authenticatorData).getUint8(32);
-    if (!(flags & 0x01) || (flags & 0x04) === 0) throw new Error("UV/UP flags missing");
-    const sigHash = await sha256(cred.response.signature);
-    return { rawId: cred.rawId, sigHash };
-  }
-
-  static async verifyLocalKey(rawId, storedHash) {
-    const computedHash = await hashDeviceKeyWithSalt(rawId);
-    return ctEq(computedHash, storedHash);
-  }
-}
-
-/*──────────────────────── 9. CAP & HISTORY HELPERS ───────────────────*/
-const periodStrings = ts => {
-  const d = new Date(ts * 1000);
-  return {
-    day: d.toISOString().slice(0, 10),
-    month: d.toISOString().slice(0, 7),
-    year: String(d.getUTCFullYear())
-  };
 };
 
-class CapEnforcer {
-  static check(vault, now, cnt = 1) {
-    const rec = vault.unlockRecords, p = periodStrings(now);
-    if (rec.day !== p.day) { rec.day = p.day; rec.dailyCount = 0; }
-    if (rec.month !== p.month) { rec.month = p.month; rec.monthlyCount = 0; }
-    if (rec.year !== p.year) { rec.year = p.year; rec.yearlyCount = 0; }
-    if (
-      rec.dailyCount + cnt > Protocol.SEGMENTS.PER_DAY ||
-      rec.monthlyCount + cnt > Protocol.SEGMENTS.PER_MONTH ||
-      rec.yearlyCount + cnt > Protocol.SEGMENTS.PER_YEAR
-    ) throw new Error("Unlock cap reached");
-    rec.dailyCount += cnt;
-    rec.monthlyCount += cnt;
-    rec.yearlyCount += cnt;
-  }
-
-  static checkBonus(vault, now, type, amount) {
-    const p = periodStrings(now);
-    if (vault.bonusRecords.day !== p.day) {
-      vault.bonusRecords.day = p.day;
-      vault.bonusRecords.dailyCount = 0;
-      vault.bonusRecords.sentCount = 0;
-      vault.bonusRecords.receivedCount = 0;
-    }
-    if (vault.bonusRecords.month !== p.month) {
-      vault.bonusRecords.month = p.month;
-      vault.bonusRecords.monthlyCount = 0;
-    }
-    if (vault.bonusRecords.annualTVM + Protocol.BONUS.PER_TX > Protocol.BONUS.MAX_ANNUAL_TVM)
-      return false;
-    if (vault.bonusRecords.dailyCount >= Protocol.BONUS.MAX_PER_DAY) return false;
-    if (vault.bonusRecords.monthlyCount >= Protocol.BONUS.MAX_PER_MONTH) return false;
-    if (type === "sent" && amount <= Protocol.BONUS.MIN_SEND_AMOUNT) return false;
-    if (type === "sent" && vault.bonusRecords.sentCount >= 2) return false;
-    if (type === "received" && vault.bonusRecords.receivedCount >= 2) return false;
-    return true;
-  }
-
-  static recordBonus(vault, type) {
-    vault.bonusRecords.dailyCount++;
-    vault.bonusRecords.monthlyCount++;
-    vault.bonusRecords.annualTVM += Protocol.BONUS.PER_TX;
-    if (type === "sent") vault.bonusRecords.sentCount++;
-    else if (type === "received") vault.bonusRecords.receivedCount++;
-  }
-}
-
-class HistoryManager {
-  static record(seg, newKey, ts, type) {
-    seg.ownershipChangeHistory.push({ ownerKey: newKey, ts, type, changeCount: seg.ownershipChangeCount });
-    if (seg.ownershipChangeHistory.length > Protocol.HISTORY_MAX)
-      seg.ownershipChangeHistory.shift();
-  }
-}
-
-/*──────────────────────── 10. SEGMENT FACTORY ────────────────────────*/
-class SegmentFactory {
-  static createAll(owner, bioConst, ts) {
-    return Array.from({ length: Protocol.SEGMENTS.TOTAL }, (_, i) => ({
-      segmentIndex: i + 1,
-      amount: 1,
-      originalOwnerKey: owner,
-      originalOwnerTS: ts,
-      originalBioConst: bioConst,
-      previousOwnerKey: null,
-      previousOwnerTS: null,
-      previousBioConst: null,
-      currentOwnerKey: i + 1 <= Protocol.SEGMENTS.UNLOCKED_INIT ? owner : null,
-      currentOwnerTS: i + 1 <= Protocol.SEGMENTS.UNLOCKED_INIT ? ts : null,
-      currentBioConst: i + 1 <= Protocol.SEGMENTS.UNLOCKED_INIT ? bioConst : null,
-      unlocked: i + 1 <= Protocol.SEGMENTS.UNLOCKED_INIT,
-      unlockIndexRef: null,
-      unlockTriggerBioConst: null,
-      unlockTriggerProof: null,
-      unlockIntegrityProof: null,
-      spentProof: null,
-      ownershipProof: null,
-      ownershipChangeCount: 0,
-      exported: false,
-      lastAuthSig: null,
-      ownershipChangeHistory: []
-    }));
-  }
-}
-
-/*──────────────────────── 11. VAULT SERVICE ──────────────────────────*/
-class VaultService {
-  static _session = null;
-
-  static async _currentDeviceRawId(credIdB64) {
-    if (!window.PublicKeyCredential || !navigator.credentials?.get) return new ArrayBuffer(0);
-    const allow = [{ id: fromB64(credIdB64), type: "public-key" }];
+// Vault Module
+const Vault = {
+  deriveKeyFromPIN: async (pin, salt) => {
+    const pinBytes = Utils.enc.encode(pin);
+    const keyMaterial = await crypto.subtle.importKey('raw', pinBytes, { name: 'PBKDF2' }, false, ['deriveKey']);
+    return crypto.subtle.deriveKey({
+      name: 'PBKDF2', salt, iterations: PBKDF2_ITERS, hash: 'SHA-256'
+    }, keyMaterial, { name: 'AES-GCM', length: AES_KEY_LENGTH }, false, ['encrypt', 'decrypt']);
+  },
+  promptAndSaveVault: async (salt = null) => {
     try {
-      const cred = await navigator.credentials.get({
-        publicKey: { allowCredentials: allow, challenge: rand(16), userVerification: "required" },
-        mediation: "optional"
-      });
-      return cred?.rawId || new ArrayBuffer(0);
-    } catch { return new ArrayBuffer(0); }
-  }
+      if (!derivedKey) throw new Error("No derivedKey");
+      let { iv, ciphertext } = await Encryption.encryptData(derivedKey, vaultData);
+      let saltBase64;
+      if (salt) {
+        saltBase64 = Encryption.bufferToBase64(salt);
+      } else {
+        let stored = await DB.loadVaultDataFromDB();
+        if (stored && stored.salt) {
+          saltBase64 = Encryption.bufferToBase64(stored.salt);
+        } else {
+          throw new Error("Salt not found => cannot persist");
+        }
+      }
+      await DB.saveVaultDataToDB(iv, ciphertext, saltBase64);
 
-  static async onboard(pin) {
-    if (pin.length < 8) throw new Error("Passphrase ≥8 chars");
-    const rawId = await WebAuthnService.enroll();
-    const devHash = await hashDeviceKeyWithSalt(rawId);
-    const now = TimeSyncService.now();
-    const bioConst = Protocol.GENESIS_BIO_CONST + (now - GENESIS_TIMESTAMP);
-    const segments = SegmentFactory.createAll(devHash, bioConst, now);
-    for (const s of segments) {
-      s.unlockIntegrityProof = await computeUnlockIntegrityProof(s);
-      s.ownershipProof = await computeOwnershipProof(s);
+      const backupPayload = {
+        iv: Encryption.bufferToBase64(iv),
+        data: Encryption.bufferToBase64(ciphertext),
+        salt: saltBase64,
+        timestamp: Date.now()
+      };
+      localStorage.setItem(VAULT_BACKUP_KEY, JSON.stringify(backupPayload));
+      vaultSyncChannel.postMessage({ type: 'vaultUpdate', payload: backupPayload });
+      console.log("Vault data stored");
+    } catch (err) {
+      console.error("Vault persist failed:", err);
+      UI.showAlert("CRITICAL: VAULT BACKUP FAILED! EXPORT IMMEDIATELY!");
     }
-    const vault = {
-      credentialId: toB64(rawId),
-      deviceKeyHashes: [devHash],
-      onboardingTS: now,
-      userBioConst: bioConst,
-      bioIBAN: `BIO${bioConst + (now - GENESIS_TIMESTAMP)}`,
-      segments,
-      unlockRecords: { day: "", dailyCount: 0, month: "", monthlyCount: 0, year: "", yearlyCount: 0 },
-      bonusRecords: {
-        day: "", dailyCount: 0, sentCount: 0, receivedCount: 0,
-        month: "", monthlyCount: 0, annualTVM: 0
-      },
-      walletAddress: "",
-      walletAddressKYC: "",
-      tvmClaimedThisYear: 0,
-      transactionHistory: [],
-      authAttempts: 0,
-      lockoutUntil: null,
-      nextBonusId: 1,
-      lastTransactionHash: "",
-      finalChainHash: ""
+  },
+  lockVault: () => {
+    if (!vaultUnlocked) return;
+    vaultUnlocked = false;
+    document.getElementById('vaultUI').classList.add('hidden');
+    document.getElementById('lockVaultBtn').classList.add('hidden');
+    document.getElementById('lockedScreen').classList.remove('hidden');
+    localStorage.setItem('vaultUnlocked', 'false');
+    console.log("🔒 Vault locked");
+  },
+  updateVaultUI: () => {
+    document.getElementById('bioIban').textContent = vaultData.bioIBAN;
+    document.getElementById('bonusConstant').textContent = vaultData.bonusConstant;
+    document.getElementById('utcTime').textContent = new Date(vaultData.lastUTCTimestamp * 1000).toUTCString();
+    document.getElementById('walletAddress').textContent = vaultData.userWallet;
+    document.getElementById('balanceTVM').textContent = (vaultData.balanceSHE / EXCHANGE_RATE).toFixed(2);
+    document.getElementById('sheMetrics').textContent = vaultData.balanceSHE;
+    document.getElementById('balanceUSD').textContent = ((vaultData.balanceSHE / EXCHANGE_RATE) / EXCHANGE_RATE).toFixed(2); // Adjust based on price
+    const tbody = document.getElementById('txTable').querySelector('tbody');
+    tbody.innerHTML = '';
+    vaultData.transactions.slice(-HISTORY_MAX).forEach(tx => {
+      const row = document.createElement('tr');
+      row.innerHTML = `<td>${tx.bioIBAN}</td><td>${tx.bioCatch}</td><td>${tx.amount}</td><td>${tx.date}</td><td>${tx.status}</td>`;
+      tbody.appendChild(row);
+    });
+  }
+};
+
+// Biometric Module
+const Biometric = {
+  performBiometricAuthenticationForCreation: async () => {
+    try {
+      const publicKey = {
+        challenge: Utils.rand(32),
+        rp: { name: "Bio-Vault" },
+        user: {
+          id: Utils.rand(16),
+          name: "bio-user",
+          displayName: "Bio User"
+        },
+        pubKeyCredParams: [
+          { type: "public-key", alg: -7 },
+          { type: "public-key", alg: -257 }
+        ],
+        authenticatorSelection: {
+          authenticatorAttachment: "platform",
+          userVerification: "required"
+        },
+        timeout: 60000,
+        attestation: "none"
+      };
+      const credential = await navigator.credentials.create({ publicKey });
+      if (!credential) return null;
+      return credential;
+    } catch (err) {
+      console.error("Biometric creation error:", err);
+      return null;
+    }
+  },
+  performBiometricAssertion: async (credentialId) => {
+    try {
+      const publicKey = {
+        challenge: Utils.rand(32),
+        allowCredentials: [{ id: Encryption.base64ToBuffer(credentialId), type: 'public-key' }],
+        userVerification: "required",
+        timeout: 60000
+      };
+      const assertion = await navigator.credentials.get({ publicKey });
+      return !!assertion;
+    } catch (err) {
+      console.error("Biometric assertion error:", err);
+      return false;
+    }
+  }
+};
+
+// Proofs Module
+const Proofs = {
+  calculateProofsHash: (proofs) => {
+    const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
+      ['tuple(uint256 segmentIndex,uint256 currentBioConst,bytes32 ownershipProof,bytes32 unlockIntegrityProof,bytes32 spentProof,uint256 ownershipChangeCount,bytes32 biometricZKP)[]'],
+      [proofs]
+    );
+    return ethers.keccak256(encoded);
+  },
+  generateProofChain: async (layer, segmentIndex, userBioConstant, biometricZKP) => {
+    const chain = [];
+    let prevOwnershipProof = ethers.ZeroHash;
+    let currentBio = userBioConstant - (layer - 1) * BIO_STEP;
+    for (let j = layer - 1; j >= 0; j--) {
+      const ownershipProof = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['uint256', 'bytes32', 'uint256'], [segmentIndex, prevOwnershipProof, currentBio]));
+      const unlockIntegrityProof = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['bytes32', 'uint256'], [ownershipProof, currentBio]));
+      const spentProof = ethers.ZeroHash;
+      const ownershipChangeCount = 1;
+      const proof = {
+        segmentIndex,
+        currentBioConst: currentBio,
+        ownershipProof,
+        unlockIntegrityProof,
+        spentProof,
+        ownershipChangeCount,
+        biometricZKP
+      };
+      chain.unshift(proof);
+      prevOwnershipProof = ownershipProof;
+      currentBio += BIO_STEP;
+    }
+    return chain;
+  },
+  generateBioCatch: async (amount, layer) => {
+    const proofs = [];
+    const userBioConstant = Math.floor(Date.now() / 1000);
+    const biometricZKP = await Utils.sha256Hex('biometric-' + userBioConstant + Utils.rand(16)); // Simulate ZKP
+    const baseIndex = BigInt(ethers.keccak256(vaultData.deviceKeyHash));
+    for (let c = 0; c < amount; c++) {
+      const segmentIndex = (baseIndex + BigInt(c)).toString();
+      const chain = await Proofs.generateProofChain(layer, segmentIndex, userBioConstant, biometricZKP);
+      proofs.push(...chain);
+    }
+    const payload = {
+      proofs,
+      layer,
+      amount,
+      deviceKeyHash: vaultData.deviceKeyHash,
+      userBioConstant
     };
-    const salt = rand(16);
-    const key = await CryptoService.deriveKey(pin, salt);
-    const { iv, ct } = await CryptoService.encrypt(key, vault);
-    await VaultStorage.save(iv, ct, toB64(salt), vault);
-    this._session = { vaultData: vault, key, salt };
-    await AuditService.log("Vault onboarded", { bioIBAN: vault.bioIBAN });
-    return vault;
-  }
-
-  static async unlock(pin) {
-    const rec = await VaultStorage.load();
-    if (!rec) throw new Error("No vault found");
-    const now = TimeSyncService.now();
-    if (rec.lockoutUntil && now < rec.lockoutUntil)
-      throw new Error(`Locked until ${new Date(rec.lockoutUntil * 1000).toLocaleString()}`);
-    const key = await CryptoService.deriveKey(pin, rec.salt);
-    let vault;
-    try { vault = await CryptoService.decrypt(key, rec.iv, rec.ciphertext); }
-    catch {
-      rec.authAttempts = (rec.authAttempts || 0) + 1;
-      if (rec.authAttempts >= Limits.AUTH.MAX_ATTEMPTS)
-        rec.lockoutUntil = now + Limits.AUTH.LOCKOUT_SECONDS;
-      await VaultStorage.save(rec.iv, rec.ciphertext, toB64(rec.salt), rec);
-      throw new Error("Bad passphrase");
-    }
-    const rawIdBuf = await this._currentDeviceRawId(vault.credentialId);
-    if (!rawIdBuf.byteLength) throw new Error("Biometric cancelled");
-    const curHash = await hashDeviceKeyWithSalt(rawIdBuf);
-    if (!vault.deviceKeyHashes.includes(curHash))
-      throw new Error("Device not registered for vault");
-    if (!(await WebAuthnService.verifyLocalKey(rawIdBuf, curHash)))
-      throw new Error("Local key verification failed");
-    rec.authAttempts = 0;
-    rec.lockoutUntil = null;
-    await VaultStorage.save(rec.iv, rec.ciphertext, toB64(rec.salt), rec);
-    vault.segments.forEach(seg => {
-      const base = seg.previousBioConst ?? seg.originalBioConst;
-      const tsBase = seg.previousOwnerTS ?? seg.originalOwnerTS;
-      seg.currentBioConst = base + (now - tsBase);
-    });
-    this._session = { vaultData: vault, key, salt: rec.salt };
-    await this.persist();
-    await AuditService.log("Vault unlocked", { bioIBAN: vault.bioIBAN });
-    return vault;
-  }
-
-  static lock() { this._session = null; }
-
-  static get current() { return this._session?.vaultData || null; }
-
-  static async persist() {
-    const s = this._session;
-    if (!s) throw new Error("Vault locked");
-    const { iv, ct } = await CryptoService.encrypt(s.key, s.vaultData);
-    await VaultStorage.save(iv, ct, toB64(s.salt), s.vaultData);
-  }
-
-  static async terminate() {
-    const db = await VaultStorage._open();
-    await new Promise((res, rej) => {
-      const tx = db.transaction(DB.STORE, "readwrite");
-      tx.objectStore(DB.STORE).delete("vaultData");
-      tx.oncomplete = res;
-      tx.onerror = () => rej(tx.error);
-    });
-    localStorage.removeItem(DB.BACKUP_KEY);
-    localStorage.removeItem("vaultOnboarded");
-    localStorage.removeItem("vaultBackedUp");
-    this._session = null;
-    await AuditService.log("Vault terminated", {});
-  }
-}
-
-/*──────────────────────── 12. SEGMENT SERVICE ─────────────────────────*/
-class SegmentService {
-  static _now() { return TimeSyncService.now(); }
-
-  static _sess() { if (!VaultService._session) throw new Error("Vault locked"); return VaultService._session; }
-
-  static async unlockNextSegment(idxRef = null) {
-    const { vaultData } = this._sess();
-    const dev = vaultData.deviceKeyHashes[0];
-    const assert = await WebAuthnService.assert(vaultData.credentialId);
-    if (!ctEq(await hashDeviceKeyWithSalt(assert.rawId), dev))
-      throw new Error("Biometric mismatch");
-    CapEnforcer.check(vaultData, this._now());
-    const locked = vaultData.segments
-      .filter(s => !s.unlocked && !s.exported && (!s.currentOwnerKey || s.currentOwnerKey === dev))
-      .sort((a, b) => a.segmentIndex - b.segmentIndex)[0];
-    if (!locked) throw new Error("No locked segment available");
-    locked.unlocked = true;
-    locked.unlockIndexRef = idxRef;
-    if (idxRef) {
-      const trg = vaultData.segments.find(s => s.segmentIndex === idxRef);
-      locked.unlockTriggerBioConst = trg?.currentBioConst || null;
-      locked.unlockTriggerProof = trg?.unlockIntegrityProof || null;
-    }
-    locked.currentOwnerKey = dev;
-    locked.currentOwnerTS = this._now();
-    locked.currentBioConst = locked.previousBioConst
-      ? locked.previousBioConst + (this._now() - locked.previousOwnerTS)
-      : locked.originalBioConst + (this._now() - locked.originalOwnerTS);
-    locked.unlockIntegrityProof = await computeUnlockIntegrityProof(locked);
-    locked.ownershipProof = await computeOwnershipProof(locked);
-    HistoryManager.record(locked, dev, this._now(), "unlock");
-    vaultData.transactionHistory.push({
-      type: "unlock",
-      segmentIndex: locked.segmentIndex,
-      timestamp: this._now(),
-      amount: locked.amount,
-      from: dev,
-      to: dev,
-      bioCatch: null,
-      status: "Unlocked"
-    });
-    await VaultService.persist();
-    await AuditService.log("Segment unlocked", { segmentIndex: locked.segmentIndex });
-    return locked;
-  }
-
-  static async transferSegment(recvKey) {
-    const { vaultData } = this._sess();
-    const dev = vaultData.deviceKeyHashes[0];
-    const assert = await WebAuthnService.assert(vaultData.credentialId);
-    if (!ctEq(await hashDeviceKeyWithSalt(assert.rawId), dev))
-      throw new Error("Biometric mismatch");
-    const seg = vaultData.segments
-      .filter(s => s.unlocked && !s.exported && s.currentOwnerKey === dev)
-      .sort((a, b) => a.segmentIndex - b.semgentIndex)[0];
-    if (!seg) throw new Error("No unlocked segment");
-    seg.previousOwnerKey = seg.currentOwnerKey;
-    seg.previousOwnerTS = seg.currentOwnerTS;
-    seg.previousBioConst = seg.currentBioConst;
-    seg.currentOwnerKey = recvKey;
-    seg.currentOwnerTS = this._now();
-    seg.currentBioConst = seg.previousBioConst + (this._now() - seg.previousOwnerTS);
-    seg.ownershipChangeCount++;
-    seg.unlocked = false;
-    seg.exported = true;
-    seg.spentProof = await computeSpentProof(seg);
-    seg.ownershipProof = await computeOwnershipProof(seg);
-    HistoryManager.record(seg, recvKey, this._now(), "transfer");
-    vaultData.transactionHistory.push({
-      type: "transfer",
-      segmentIndex: seg.segmentIndex,
-      timestamp: this._now(),
-      amount: seg.amount,
-      from: dev,
-      to: recvKey,
-      bioCatch: null,
-      status: "Sent"
-    });
-    if (recvKey !== dev) {
-      try { await this.unlockNextSegment(seg.segmentIndex); } catch (e) { console.warn("Auto-unlock failed:", e.message); }
-    }
-    await VaultService.persist();
-    return seg;
-  }
-
-  static async exportSegmentsBatch(recvKey, count) {
-    const { vaultData } = this._sess();
-    const dev = vaultData.deviceKeyHashes[0];
-    const unlocked = vaultData.segments.filter(s => s.unlocked && !s.exported && s.currentOwnerKey === dev);
-    if (unlocked.length < count) throw new Error(`Only ${unlocked.length} segment(s) unlocked`);
-    const batch = [];
-    let bioCatchSize = 0;
-    let bonusGranted = false;
-    if (CapEnforcer.checkBonus(vaultData, this._now(), "sent", count)) {
-      CapEnforcer.recordBonus(vaultData, "sent");
-      bonusGranted = true;
-    }
-    for (let i = 0; i < count; i += Limits.BATCH_SIZE) {
-      const chunk = Math.min(Limits.BATCH_SIZE, count - i);
-      for (let j = 0; j < chunk; j++) {
-        const seg = await this.transferSegment(recvKey);
-        const plainBio = await this.generateBioCatchNumber(
-          vaultData.bioIBAN, recvKey, seg.amount, this._now(), vaultData.tvmClaimedThisYear, vaultData.finalChainHash
-        );
-        const obfBio = await CryptoService.encryptBioCatchNumber(plainBio);
-        const tx = vaultData.transactionHistory.find(t => t.segmentIndex === seg.segmentIndex && t.type === "transfer");
-        tx.bioCatch = obfBio;
-        const payload = { ...seg, bioCatch: obfBio };
-        batch.push(payload);
-        bioCatchSize += JSON.stringify(payload).length;
-      }
-    }
-    document.getElementById("bioCatchSize").textContent = `Size: ${(bioCatchSize / 1024 / 1024).toFixed(2)} MB`;
-    if (bonusGranted) {
-      const offset = this._now() - vaultData.onboardingTS;
-      const bonusIBAN = `BONUS${vaultData.userBioConst + offset}`;
-      const bonusTx = {
-        type: "cashback",
-        amount: Protocol.BONUS.PER_TX,
-        timestamp: this._now(),
-        status: "Granted",
-        bonusConstantAtGeneration: vaultData.userBioConst,
-        previousHash: vaultData.lastTransactionHash,
-        txHash: "",
-        senderBioIBAN: bonusIBAN,
-        triggerOrigin: "sent",
-        bonusId: vaultData.nextBonusId++
-      };
-      bonusTx.txHash = await this.computeTransactionHash(vaultData.lastTransactionHash, bonusTx);
-      vaultData.transactionHistory.push(bonusTx);
-      vaultData.lastTransactionHash = bonusTx.txHash;
-      vaultData.finalChainHash = await vaultData.transactionHistory.reduce(async (hash, tx) => {
-        const tmp = {
-          type: tx.type, amount: tx.amount, timestamp: tx.timestamp, status: tx.status, bioCatch: tx.bioCatch,
-          bonusConstantAtGeneration: tx.bonusConstantAtGeneration, previousHash: await hash
-        };
-        return this.computeTransactionHash(rHash, tmp);
-      }, Promise.resolve(""));
-      if (vaultData.walletAddress && vaultData.credentialId) {
-        await ChainService.redeemBonusOnChain(bonusTx);
-      }
-    }
-    vaultData.finalChainHash = await vaultData.transactionHistory.reduce(async (hash, tx) => {
-      const tmp = {
-        type: tx.type, amount: tx.amount, timestamp: tx.timestamp, status: tx.status, bioCatch: tx.bioCatch,
-        bonusConstantAtGeneration: tx.bonusConstantAtGeneration, previousHash: await hash
-      };
-      return this.computeTransactionHash(await hash, tmp);
-    }, Promise.resolve(""));
-    await VaultService.persist();
-    const payload = JSON.stringify(batch);
-    await AuditService.log("Segments exported", { count, bioCatchSize });
-    return payload;
-  }
-
-  static async importSegmentsBatch(raw, recvKey) {
-    let list;
-    try { list = JSON.parse(raw); } catch { throw new Error("Corrupt payload"); }
-    if (!Array.isArray(list) || !list.length) throw new Error("Empty payload");
-    list.forEach(seg => {
-      if (!seg.exported) throw new Error("Payload already claimed");
-      if (!ctEq(seg.currentOwnerKey, recvKey)) throw new Error("Segment not addressed to this vault");
-    });
-    return list;
-  }
-
-  static async claimReceivedSegmentsBatch(list) {
-    const { vaultData } = this._sess();
-    const now = this._now();
-    let bonusGranted = false;
-    if (CapEnforcer.checkBonus(vaultData, now, "received", list.length)) {
-      CapEnforcer.recordBonus(vaultData, "received");
-      bonusGranted = true;
-    }
-    for (const seg of list) {
-      const existing = vaultData.segments.find(s => s.segmentIndex === seg.segmentIndex);
-      if (existing) {
-        if (!ctEq(existing.ownershipProof, seg.ownershipProof))
-          throw new Error(`Replay / fork on segment #${seg.segmentIndex}`);
-        continue;
-      }
-      if (!ctEq(seg.ownershipProof, await computeOwnershipProof(seg)))
-        throw new Error(`Bad ownership proof for segment #${seg.segmentIndex}`);
-      if (seg.unlockIndexRef !== null &&
-          !ctEq(seg.unlockIntegrityProof, await computeUnlockIntegrityProof(seg)))
-        throw new Error(`Bad unlock proof for segment #${seg.segmentIndex}`);
-      if (seg.spentProof && !ctEq(seg.spentProof, await computeSpentProof(seg)))
-        throw new Error(`Bad spent proof for segment #${seg.segmentIndex}`);
-      if (seg.bioCatch) {
-        const plainBio = await CryptoService.decryptBioCatchNumber(seg.bioCatch);
-        if (!plainBio) throw new Error("Invalid BioCatch");
-        const validation = await this.validateBioCatchNumber(plainBio, seg.amount);
-        if (!validation.valid) throw new Error(`BioCatch fail: ${validation.message}`);
-      }
-      seg.exported = false;
-      vaultData.segments.push(seg);
-      vaultData.transactionHistory.push({
-        type: "received",
-        segmentIndex: seg.segmentIndex,
-        timestamp: now,
-        amount: seg.amount,
-        from: seg.previousOwnerKey,
-        to: vaultData.deviceKeyHashes[0],
-        bioCatch: seg.bioCatch,
-        status: "Received"
-      });
-    }
-    if (bonusGranted) {
-      const offset = now - vaultData.onboardingTS;
-      const bonusIBAN = `BONUS${vaultData.userBioConst + offset}`;
-      const bonusTx = {
-        type: "cashback",
-        amount: Protocol.BONUS.PER_TX,
-        timestamp: now,
-        status: "Granted",
-        bonusConstantAtGeneration: vaultData.userBioConst,
-        previousHash: vaultData.lastTransactionHash,
-        txHash: "",
-        senderBioIBAN: bonusIBAN,
-        triggerOrigin: "received",
-        bonusId: vaultData.nextBonusId++
-      };
-      bonusTx.txHash = await this.computeTransactionHash(vaultData.lastTransactionHash, bonusTx);
-      vaultData.transactionHistory.push(bonusTx);
-      vaultData.lastTransactionHash = bonusTx.txHash;
-      vaultData.finalChainHash = await vaultData.transactionHistory.reduce(async (hash, tx) => {
-        const tmp = {
-          type: tx.type, amount: tx.amount, timestamp: tx.timestamp, status: tx.status, bioCatch: tx.bioCatch,
-          bonusConstantAtGeneration: tx.bonusConstantAtGeneration, previousHash: await hash
-        };
-        return this.computeTransactionHash(await hash, tmp);
-      }, Promise.resolve(""));
-      if (vaultData.walletAddress && vaultData.credentialId) {
-        await ChainService.redeemBonusOnChain(bonusTx);
-      }
-    }
-    vaultData.finalChainHash = await vaultData.transactionHistory.reduce(async (hash, tx) => {
-      const tmp = {
-        type: tx.type, amount: tx.amount, timestamp: tx.timestamp, status: tx.status, bioCatch: tx.bioCatch,
-        bonusConstantAtGeneration: tx.bonusConstantAtGeneration, previousHash: await hash
-      };
-      return this.computeTransactionHash(await hash, tmp);
-    }, Promise.resolve(""));
-    await VaultService.persist();
-    await AuditService.log("Segments claimed", { count: list.length });
-  }
-
-  static async computeTransactionHash(prevHash, txObj) {
-    const dataStr = JSON.stringify({ prevHash, ...txObj });
-    const buf = enc.encode(dataStr);
-    const hashBuf = await crypto.subtle.digest("SHA-256", buf);
-    return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  static async generateBioCatchNumber(senderBioIBAN, receiverBioIBAN, amount, timestamp, senderBalance, finalChainHash) {
-    const now = this._now();
-    if (Math.abs(now - timestamp) > Limits.TRANSACTION_VALIDITY_SECONDS)
-      throw new Error("Timestamp out of validity window");
-    const data = `${senderBioIBAN}|${receiverBioIBAN}|${amount}|${timestamp}|${senderBalance}|${finalChainHash}`;
-    return await sha256Hex(data);
-  }
-
-  static async validateBioCatchNumber(bioCatchNumber, claimedAmount) {
-    return { valid: true, message: "", claimedSenderIBAN: "BIO123" };
-  }
-}
-
-/*──────────────────────── 13. BACKUP SERVICE ─────────────────────────*/
-class BackupService {
-  static async exportEncryptedBackup(vault, pwd) {
-    if (!pwd || pwd.length < 8) throw new Error("Password ≥8 chars");
-    const salt = rand(16);
-    const key = await CryptoService.deriveKey(pwd, salt);
-    const { iv, ct } = await CryptoService.encrypt(key, vault);
-    const backup = { salt: toB64(salt), iv: toB64(iv), ciphertext: toB64(ct) };
-    await AuditService.log("Backup exported", { size: JSON.stringify(backup).length });
-    return backup;
-  }
-
-  static async importEncryptedBackup(payload, pwd) {
-    const salt = fromB64(payload.salt), iv = fromB64(payload.iv), ct = fromB64(payload.ciphertext);
-    const key = await CryptoService.deriveKey(pwd, salt);
-    const vault = await CryptoService.decrypt(key, iv, ct);
-    await AuditService.log("Backup imported", { bioIBAN: vault.bioIBAN });
-    return vault;
-  }
-
-  static exportFriendly(vault) {
-    const blob = new Blob([JSON.stringify(vault)], { type: "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const a = Object.assign(document.createElement("a"), { href: url, download: "myBioVault.vault" });
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    AuditService.log("Friendly backup exported", { bioIBAN: vault.bioIBAN });
-  }
-}
-
-/*──────────────────────── 14. AUDIT SERVICE ─────────────────────────*/
-class AuditService {
-  static async log(event, meta) {
-    console.log(`[AUDIT] ${event}`, meta);
-  }
-
-  static generateAuditReport(vault, { fullHistory = false } = {}) {
-    const lim = Protocol.HISTORY_MAX;
-    return {
-      bioIBAN: vault.bioIBAN,
-      deviceKeyHashes: vault.deviceKeyHashes.map(h => h.slice(0, 8) + "…"),
-      onboardingTS: vault.onboardingTS,
-      userBioConst: vault.userBioConst,
-      segments: vault.segments.map(s => ({
-        ...s,
-        ownershipChangeHistory: fullHistory ? s.ownershipChangeHistory : s.ownershipChangeHistory.slice(-lim)
-      })),
-      tvmClaimedThisYear: vault.tvmClaimedThisYear,
-      walletAddressKYC: vault.walletAddressKYC
+    // Encrypt payload
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+    const exportedKey = await crypto.subtle.exportKey('raw', key);
+    const iv = Utils.rand(12);
+    const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, Utils.enc.encode(JSON.stringify(payload)));
+    const encryptedPayload = {
+      key: Utils.toB64(exportedKey),
+      iv: Utils.toB64(iv),
+      data: Utils.toB64(encrypted)
     };
-  }
-
-  static exportComplianceReport(vault) {
-    const report = this.generateAuditReport(vault, { fullHistory: true });
-    const blob = new Blob([JSON.stringify(report)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = Object.assign(document.createElement("a"), { href: url, download: `compliance_${vault.bioIBAN}.json` });
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    this.log("Compliance report exported", { bioIBAN: vault.bioIBAN });
-    return report;
-  }
-
-  static async verifyProofChain(segments, expectedKey) {
-    for (const seg of segments) {
-      if (!ctEq(seg.currentOwnerKey, expectedKey))
-        throw new Error(`Seg#${seg.segmentIndex}: owner mismatch`);
-      if (!ctEq(seg.ownershipProof, await computeOwnershipProof(seg)))
-        throw new Error(`Seg#${seg.segmentIndex}: ownership proof bad`);
-      if (seg.unlockIndexRef !== null &&
-          !ctEq(seg.unlockIntegrityProof, await computeUnlockIntegrityProof(seg)))
-        throw new Error(`Seg#${seg.segmentIndex}: unlock proof bad`);
-      if (seg.spentProof && !ctEq(seg.spentProof, await computeSpentProof(seg)))
-        throw new Error(`Seg#${seg.segmentIndex}: spent proof bad`);
+    return JSON.stringify(encryptedPayload);
+  },
+  decryptBioCatch: async (encryptedStr) => {
+    const encryptedPayload = JSON.parse(encryptedStr);
+    const key = await crypto.subtle.importKey('raw', Utils.fromB64(encryptedPayload.key), 'AES-GCM', false, ['decrypt']);
+    const iv = Utils.fromB64(encryptedPayload.iv);
+    const data = Utils.fromB64(encryptedPayload.data);
+    const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+    return JSON.parse(Utils.dec.decode(decrypted));
+  },
+  validateProofs: async (proofs, layer, userBioConstant) => {
+    if (proofs.length % layer !== 0) return false;
+    const segmentCount = proofs.length / layer;
+    for (let c = 0; c < segmentCount; c++) {
+      const chain = proofs.slice(c * layer, (c + 1) * layer);
+      let prevBio = chain[chain.length - 1].currentBioConst;
+      let prevOwnershipProof = ethers.ZeroHash;
+      for (let i = chain.length - 1; i >= 0; i--) {
+        const currentProof = chain[i];
+        if (currentProof.currentBioConst <= prevBio) return false;
+        if (currentProof.currentBioConst > Math.floor(Date.now() / 1000) + BIO_TOLERANCE) return false;
+        if (currentProof.currentBioConst < userBioConstant - i * BIO_STEP) return false;
+        const calculatedOwnershipProof = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['uint256', 'bytes32', 'uint256'], [currentProof.segmentIndex, prevOwnershipProof, currentProof.currentBioConst]));
+        if (currentProof.ownershipProof !== calculatedOwnershipProof) return false;
+        const calculatedUnlockIntegrityProof = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['bytes32', 'uint256'], [currentProof.ownershipProof, currentProof.currentBioConst]));
+        if (currentProof.unlockIntegrityProof !== calculatedUnlockIntegrityProof) return false;
+        if (currentProof.spentProof !== ethers.ZeroHash) return false;
+        if (currentProof.ownershipChangeCount !== 1) return false;
+        if (currentProof.biometricZKP === ethers.ZeroHash) return false;
+        prevBio = currentProof.currentBioConst;
+        prevOwnershipProof = currentProof.ownershipProof;
+      }
     }
     return true;
+  },
+  signClaim: async (proofs, deviceKeyHash, userBioConstant, nonce) => {
+    const proofsHash = Proofs.calculateProofsHash(proofs);
+    const message = {
+      user: account,
+      proofsHash,
+      deviceKeyHash,
+      userBioConstant,
+      nonce
+    };
+    const domain = {
+      name: 'TVM',
+      version: '1',
+      chainId,
+      verifyingContract: CONTRACT_ADDRESS
+    };
+    const types = {
+      Claim: [
+        { name: 'user', type: 'address' },
+        { name: 'proofsHash', type: 'bytes32' },
+        { name: 'deviceKeyHash', type: 'bytes32' },
+        { name: 'userBioConstant', type: 'uint256' },
+        { name: 'nonce', type: 'uint256' }
+      ]
+    };
+    return await signer.signTypedData(domain, types, message);
   }
+};
 
-  static pruneHistory(vault) {
-    vault.segments.forEach(s => {
-      s.ownershipChangeHistory = s.ownershipChangeHistory.slice(-Protocol.HISTORY_MAX);
-    });
-    this.log("History pruned", { bioIBAN: vault.bioIBAN });
-  }
-}
-
-/*──────────────────────── 15. CHAIN SERVICE ─────────────────────────*/
-const CONTRACT = "0xYourDeployedAddressHere";
-const claimAbi = [];
-const ChainService = (() => {
-  let provider = null, signer = null;
-  return {
-    initWeb3() {
-      if (window.ethereum && !provider) {
-        provider = new ethers.providers.Web3Provider(window.ethereum, "any");
-        signer = provider.getSigner();
-      }
-    },
-
-    async submitClaimOnChain(bundle) {
-      if (!signer) throw new Error("Connect wallet first");
-      const v = VaultService.current;
-      if (!v.walletAddressKYC || !/^0x[a-fA-F0-9]{40}$/.test(v.walletAddressKYC))
-        throw new Error("KYC’d wallet address required");
-      const domain = { name: "TVMClaim", version: "1", chainId: await signer.getChainId(), verifyingContract: CONTRACT };
-      const types = {
-        SegmentProof: [
-          { name: "segmentIndex", type: "uint32" },
-          { name: "spentProof", type: "bytes32" },
-          { name: "ownershipProof", type: "bytes32" },
-          { name: "unlockIntegrityProof", type: "bytes32" }
-        ]
-      };
-      const sig = await signer._signTypedData(domain, types, { segmentProofs: bundle });
-      const contract = new ethers.Contract(CONTRACT, claimAbi, signer);
-      const tx = await contract.claimTVM(bundle, sig);
-      const receipt = await tx.wait();
-      await AuditService.log("TVM claimed", { txHash: receipt.transactionHash, segments: bundle.length });
-      return receipt;
-    },
-
-    async redeemBonusOnChain(tx) {
-      if (!signer) throw new Error("Connect wallet first");
-      if (!tx || !tx.bonusId) throw new Error("Invalid bonus or missing bonusId");
-      const v = VaultService.current;
-      if (!v.walletAddressKYC) throw new Error("KYC’d wallet address required");
-      const userAddr = await signer.getAddress();
-      if (userAddr.toLowerCase() !== v.walletAddressKYC.toLowerCase())
-        console.warn("Active MetaMask address != vaultData.walletAddressKYC. Proceeding...");
-      toast(`(Stub) Bonus #${tx.bonusId} minted to ${v.walletAddressKYC}`);
-      await AuditService.log("Bonus redeemed", { bonusId: tx.bonusId });
-    },
-
-    async emergencyPause() {
-      console.log("Emergency pause triggered (stub)");
-      await AuditService.log("Contract paused", {});
-    },
-
-    getSigner() { return signer; },
-
-    async verifyPeg() {
-      return true;
+// Wallet Module
+const Wallet = {
+  connectMetaMask: async () => {
+    if (!window.ethereum) {
+      UI.showAlert('MetaMask is not installed!');
+      return;
     }
-  };
-})();
-
-/*──────────────────────── 16. TOKEN SERVICE ─────────────────────────*/
-class TokenService {
-  static _vault() { const v = VaultService.current; if (!v) throw new Error("Vault locked"); return v; }
-
-  static getAvailableTVMClaims() {
-    const v = this._vault(), dev = v.deviceKeyHashes[0];
-    const used = v.segments.filter(s => s.currentOwnerKey === dev && (s.unlocked || s.ownershipChangeCount > 0)).length;
-    const claimed = v.tvmClaimedThisYear || 0;
-    return Math.max(Math.floor(used / Protocol.TVM.SEGMENTS_PER_TOKEN) - claimed, 0);
-  }
-
-  static async claimTvmTokens() {
-    const v = this._vault();
-    const avail = this.getAvailableTVMClaims();
-    if (!v.walletAddressKYC || !/^0x[a-fA-F0-9]{40}$/.test(v.walletAddressKYC))
-      throw new Error("KYC’d wallet address required");
-    if (avail <= 0) throw new Error("Nothing to claim");
-    if ((v.tvmClaimedThisYear || 0) + avail > Protocol.TVM.CLAIM_CAP)
-      throw new Error("Yearly TVM cap reached");
-    const needed = avail * Protocol.TVM.SEGMENTS_PER_TOKEN;
-    const segs = v.segments.filter(s => s.ownershipChangeCount > 0 || s.unlocked).slice(0, needed);
-    const bundle = segs.map(s => ({
-      segmentIndex: s.segmentIndex,
-      spentProof: s.spentProof,
-      ownershipProof: s.ownershipProof,
-      unlockIntegrityProof: s.unlockIntegrityProof
-    }));
-    await ChainService.submitClaimOnChain(bundle);
-    v.tvmClaimedThisYear += avail;
-    await VaultService.persist();
-    await AuditService.log("TVM tokens claimed", { count: avail });
-    return bundle;
-  }
-}
-
-/*──────────────────────── 17. UI HELPERS ───────────────────────────*/
-const toast = (msg, err = false) => {
-  const el = document.getElementById("toast");
-  if (!el) return;
-  el.textContent = msg;
-  el.className = `toast ${err ? "toast-error" : ""}`;
-  el.style.display = "block";
-  setTimeout(() => el.style.display = "none", 3200);
-};
-
-const copyToClipboard = async text => {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast("Copied");
-  } catch {
-    const ta = Object.assign(document.createElement("textarea"), { value: text });
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand("copy"); toast("Copied"); } catch { toast("Copy failed", true); }
-    ta.remove();
-  }
-};
-
-let lastInvoker = null;
-const openModal = id => {
-  document.querySelectorAll(".modal, .popup").forEach(m => m.style.display = "none");
-  const modal = document.getElementById(id);
-  if (modal) {
-    modal.style.display = "flex";
-    const focusEl = modal.querySelector('[tabindex="0"]');
-    if (focusEl) setTimeout(() => focusEl.focus(), 130);
-    lastInvoker = document.activeElement;
-    document.body.style.overflow = "hidden";
-  }
-};
-
-const closeModal = id => {
-  const modal = document.getElementById(id);
-  if (modal) modal.style.display = "none";
-  document.body.style.overflow = "";
-  lastInvoker?.focus();
-};
-
-const modalNav = (modalId, pageIdx) => {
-  const modal = document.getElementById(modalId);
-  if (!modal) return;
-  const pages = modal.querySelectorAll(".modal-onboarding-page");
-  pages.forEach((p, i) => p.classList.toggle("hidden", i !== pageIdx));
-  const nav = modal.querySelectorAll(".modal-nav button");
-  nav.forEach((btn, i) => btn.classList.toggle("active", i === pageIdx));
-};
-
-let deferredPrompt = null;
-window.addEventListener("beforeinstallprompt", e => {
-  e.preventDefault();
-  deferredPrompt = e;
-  console.log("⭐ A2HS prompt captured");
-});
-
-const promptInstallA2HS = () => {
-  if (!deferredPrompt) { toast("No A2HS prompt available", true); return; }
-  deferredPrompt.prompt();
-  deferredPrompt.userChoice.then(choice => {
-    console.log("A2HS", choice.outcome);
-    AuditService.log("A2HS prompt", { outcome: choice.outcome });
-    deferredPrompt = null;
-  });
-};
-
-const generateQRCode = data => {
-  const canvas = document.getElementById("qrCodeCanvas");
-  if (!canvas) return;
-  QRCode.toCanvas(canvas, data, { width: 200, margin: 2 }, err => {
-    if (err) toast("QR code generation failed", true);
-  });
-};
-
-const showOnboardingIfNeeded = () => {
-  if (!localStorage.getItem("vaultOnboarded")) {
-    openModal("onboardingModal");
-    modalNav("onboardingModal", 0);
-    localStorage.setItem("vaultOnboarded", "yes");
-  }
-};
-
-const showBackupReminder = () => {
-  const tip = document.getElementById("onboardingTip");
-  if (tip) tip.style.display = localStorage.getItem("vaultBackedUp") ? "none" : "";
-};
-
-/*──────────────────────── 18. TRANSACTION TABLE ───────────────────*/
-let transactionPage = 0;
-const renderTransactions = () => {
-  const v = VaultService.current;
-  const tbody = document.getElementById("transactionBody");
-  const empty = document.getElementById("txEmptyState");
-  const prev = document.getElementById("txPrevBtn");
-  const next = document.getElementById("txNextBtn");
-  if (!tbody || !v) return;
-  tbody.innerHTML = "";
-  if (!v.transactionHistory.length) {
-    empty.style.display = "";
-    prev.style.display = "none";
-    next.style.display = "none";
-    return;
-  }
-  empty.style.display = "none";
-  const pageSize = Limits.PAGE.DEFAULT_SIZE;
-  const start = transactionPage * pageSize;
-  const end = start + pageSize;
-  v.transactionHistory.slice(start, end).forEach(tx => {
-    const proof = tx.bioCatch ? tx.bioCatch.slice(0, 8) + "..." : "N/A";
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${tx.type === "cashback" ? `Bonus #${tx.bonusId}` : (tx.to === v.deviceKeyHashes[0] ? tx.from : tx.to).slice(0, 10) + "…"}</td>
-      <td>${tx.bioCatch ? tx.bioCatch.slice(0, 8) + "..." : "—"}</td>
-      <td>${proof}</td>
-      <td>${tx.amount}</td>
-      <td>${new Date(tx.timestamp * 1000).toLocaleString()}</td>
-      <td>${tx.status}</td>
-    `;
-    tbody.appendChild(tr);
-  });
-  prev.style.display = transactionPage > 0 ? "" : "none";
-  next.style.display = end < v.transactionHistory.length ? "" : "none";
-};
-
-/*──────────────────────── 19. DASHBOARD RENDER ────────────────────*/
-const renderVaultUI = () => {
-  const v = VaultService.current;
-  if (!v) {
-    document.getElementById("lockedScreen").style.display = "block";
-    document.getElementById("vaultUI").style.display = "none";
-    return;
-  }
-  document.getElementById("lockedScreen").style.display = "none";
-  document.getElementById("vaultUI").style.display = "block";
-  const bioibanInput = document.getElementById("bioibanInput");
-  if (bioibanInput) {
-    bioibanInput.value = v.bioIBAN || "BIO…";
-    bioibanInput.readOnly = true;
-  }
-  const segUsed = v.segments.filter(s => s.ownershipChangeCount > 0 || s.unlocked).length;
-  const balance = segUsed;
-  v.tvmClaimedThisYear = Math.floor(balance / Protocol.TVM.SEGMENTS_PER_TOKEN);
-  v.balanceUSD = +(balance / Protocol.TVM.EXCHANGE_RATE).toFixed(2);
-  document.getElementById("tvmBalance").textContent = `Balance: ${balance} TVM`;
-  document.getElementById("usdBalance").textContent = `Equivalent: ${v.balanceUSD} USD`;
-  document.getElementById("segmentStatus").textContent = `Segments: ${segUsed}/${Protocol.SEGMENTS.TOTAL} Unlocked`;
-  document.getElementById("bioLineText").textContent = `🔄 Bio-Constant: ${v.userBioConst}`;
-  document.getElementById("userWalletAddress").value = v.walletAddressKYC || "";
-  document.getElementById("tvmClaimable").textContent = `TVM Claimable: ${TokenService.getAvailableTVMClaims()}`;
-  renderTransactions();
-  showBackupReminder();
-};
-
-/*──────────────────────── 20. SAFE HANDLER ─────────────────────────*/
-const safeHandler = f => async (...args) => {
-  try {
-    await f(...args);
-  } catch (e) {
-    console.error(e);
-    await AuditService.log("Error", { message: e.message });
-    toast(e.message || "Error", true);
-  }
-};
-
-/*──────────────────────── 21. INITIALIZATION & EVENT BINDING ────────*/
-(() => {
-  // Service Worker Registration
-  if ("serviceWorker" in navigator) {
-    window.addEventListener("load", () => {
-      navigator.serviceWorker.register("./sw.js")
-        .then(reg => console.log("Service Worker registered:", reg.scope))
-        .catch(err => console.error("Service Worker registration failed:", err));
-    });
-  }
-
-  // Modal and Popup Accessibility
-  document.addEventListener("keydown", e => {
-    if (e.key === "Escape") {
-      document.querySelectorAll(".modal, .popup").forEach(m => m.style.display = "none");
-      document.body.style.overflow = "";
+    provider = new ethers.BrowserProvider(window.ethereum);
+    await provider.send("eth_requestAccounts", []);
+    signer = await provider.getSigner();
+    account = await signer.getAddress();
+    chainId = Number(await provider.getNetwork().then(net => net.chainId));
+    Wallet.initContracts();
+    UI.updateConnectedAccount();
+    await Wallet.updateBalances();
+    Wallet.subscribeToEvents();
+  },
+  connectWalletConnect: async () => {
+    try {
+      const wcProvider = await EthereumProvider.init({
+        projectId: WALLET_CONNECT_PROJECT_ID,
+        metadata: {
+          name: "Bio-Vault",
+          description: "P2P Bio-Vault App",
+          url: window.location.origin,
+          icons: ["https://avatars.githubusercontent.com/u/37784886"]
+        },
+        showQrModal: true,
+        chains: [1] // Assume mainnet, adjust
+      });
+      await wcProvider.enable();
+      provider = new ethers.BrowserProvider(wcProvider);
+      signer = await provider.getSigner();
+      account = await signer.getAddress();
+      chainId = Number(await provider.getNetwork().then(net => net.chainId));
+      Wallet.initContracts();
+      UI.updateConnectedAccount();
+      await Wallet.updateBalances();
+      Wallet.subscribeToEvents();
+      wcProvider.on("chainChanged", Wallet.handleChainChanged);
+      wcProvider.on("accountsChanged", Wallet.handleAccountsChanged);
+      wcProvider.on("disconnect", Wallet.handleDisconnect);
+    } catch (err) {
+      console.error("WalletConnect error:", err);
+      UI.showAlert('WalletConnect connection failed: ' + err.message);
     }
-  });
-
-  document.querySelectorAll(".modal, .popup").forEach(modal => {
-    modal.addEventListener("click", e => {
-      if (e.target === modal) {
-        modal.style.display = "none";
-        document.body.style.overflow = "";
+  },
+  initContracts: () => {
+    tvmContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+    usdtContract = new ethers.Contract(USDT_ADDRESS, [
+      'function balanceOf(address) view returns (uint256)',
+      'function approve(address, uint256) returns (bool)',
+      'function allowance(address, address) view returns (uint256)'
+    ], signer);
+  },
+  updateBalances: async () => {
+    if (!account) return;
+    try {
+      const tvmBal = await tvmContract.balanceOf(account);
+      document.getElementById('tvmBalance').textContent = ethers.formatUnits(tvmBal, 6);
+      const usdtBal = await usdtContract.balanceOf(account);
+      document.getElementById('usdtBalance').textContent = ethers.formatUnits(usdtBal, 6);
+      const price = await tvmContract.tvmPrice();
+      document.getElementById('tvmPrice').textContent = price.toString();
+      document.getElementById('balanceTVM').textContent = ethers.formatUnits(tvmBal, 6);
+      document.getElementById('balanceUSD').textContent = (Number(ethers.formatUnits(tvmBal, 6)) * Number(price) / DECIMALS_FACTOR).toFixed(2);
+    } catch (err) {
+      console.error("Balance update error:", err);
+    }
+  },
+  subscribeToEvents: () => {
+    tvmContract.on("TVMClaimed", (user, amount, segmentCount, chainHash) => {
+      if (user.toLowerCase() === account.toLowerCase()) {
+        UI.showAlert(`TVM Claimed: ${amount} TVM`);
+        Wallet.updateBalances();
+        Notifications.sendPush('TVM Claimed', `You claimed ${amount} TVM`);
       }
     });
-  });
-
-  // UTC Clock
-  setInterval(TimeSyncService.updateUTCClock, 1000);
-  TimeSyncService.updateUTCClock();
-  TimeSyncService.sync();
-
-  // Session Auto-Lock
-  let timer;
-  const resetIdleTimer = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => {
-      VaultService.lock();
-      location.reload();
-    }, MAX_IDLE);
-  };
-  ["click", "mousemove", "keypress"].forEach(event =>
-    document.addEventListener(event, resetIdleTimer)
-  );
-
-  // Button Wiring
-  const devHash = () => VaultService.current?.deviceKeyHashes[0];
-
-  document.getElementById("enterVaultBtn")?.addEventListener("click", safeHandler(() => {
-    const modal = document.getElementById("passModal");
-    const title = document.getElementById("passModalTitle");
-    const confirmLabel = document.getElementById("passModalConfirmLabel");
-    const confirmInput = document.getElementById("passModalConfirmInput");
-    title.textContent = localStorage.getItem("vaultOnboarded") ? "Unlock Vault" : "Create Vault";
-    confirmLabel.classList.toggle("hidden", !!localStorage.getItem("vaultOnboarded"));
-    confirmInput.classList.toggle("hidden", !!localStorage.getItem("vaultOnboarded"));
-    openModal("passModal");
-  }));
-
-  document.getElementById("passModalSaveBtn")?.addEventListener("click", safeHandler(async () => {
-    const pin = document.getElementById("passModalInput").value;
-    const confirm = document.getElementById("passModalConfirmInput").value;
-    if (!pin || pin.length < 8) throw new Error("Passphrase must be ≥8 characters");
-    if (!localStorage.getItem("vaultOnboarded")) {
-      if (pin !== confirm) throw new Error("Passphrases do not match");
-      await VaultService.onboard(pin);
-    } else {
-      await VaultService.unlock(pin);
-    }
-    closeModal("passModal");
-    renderVaultUI();
-  }));
-
-  document.getElementById("passModalCancelBtn")?.addEventListener("click", () => closeModal("passModal"));
-
-  document.getElementById("lockVaultBtn")?.addEventListener("click", safeHandler(async () => {
-    VaultService.lock();
-    renderVaultUI();
-    toast("Vault locked");
-  }));
-
-  document.getElementById("terminateBtn")?.addEventListener("click", safeHandler(async () => {
-    if (!confirm("Permanently terminate vault? All funds will be lost without backup.")) return;
-    await VaultService.terminate();
-    renderVaultUI();
-    toast("Vault terminated");
-  }));
-
-  document.getElementById("testModeBtn")?.addEventListener("click", () => {
-    toast("Test mode: Simulate transactions in console");
-    console.log("Test mode: Simulating transfer of 1 segment...");
-  });
-
-  document.getElementById("copyBioIBANBtn")?.addEventListener("click", () => copyToClipboard(
-    document.getElementById("bioibanInput").value));
-
-  document.getElementById("catchOutBtn")?.addEventListener("click", safeHandler(async () => {
-    const recv = document.getElementById("receiverBioIBAN").value.trim();
-    const amt = Number(document.getElementById("catchOutAmount").value);
-    if (!recv || !Number.isInteger(amt) || amt <= 0) throw new Error("Receiver & integer amount required");
-    if (!/^BIO\d+$/.test(recv) && !/^BONUS\d+$/.test(recv)) throw new Error("Invalid Bio-IBAN");
-    if (recv === VaultService.current?.bioIBAN) throw new Error("Cannot send to self");
-    if (amt > 10000 && !confirm("Large transfer (>10,000 segments) may take time. Proceed?")) return;
-    if (!confirm(`Send ${amt} segment${amt > 1 ? "s" : ""} to ${recv}?`)) return;
-    const payload = await SegmentService.exportSegmentsBatch(recv, amt);
-    copyToClipboard(payload);
-    generateQRCode(payload);
-    toast(`Exported ${amt} segment${amt > 1 ? "s" : ""}. Payload copied & QR generated.`);
-    renderVaultUI();
-  }));
-
-  document.getElementById("catchInBtn")?.addEventListener("click", safeHandler(async () => {
-    const raw = document.getElementById("catchInBioCatch").value.trim();
-    if (!raw) throw new Error("Paste the received payload");
-    if (!confirm("Claim received segments?")) return;
-    const segs = await SegmentService.importSegmentsBatch(raw, devHash());
-    await SegmentService.claimReceivedSegmentsBatch(segs);
-    toast(`Claimed ${segs.length} segment${segs.length > 1 ? "s" : ""}`);
-    renderVaultUI();
-  }));
-
-  document.getElementById("showBioCatchBtn")?.addEventListener("click", safeHandler(async () => {
-    const v = VaultService.current;
-    const seg = v.segments.find(s => s.unlocked && s.currentOwnerKey === devHash());
-    if (!seg) throw new Error("Unlock a segment first");
-    const plainBio = await SegmentService.generateBioCatchNumber(
-      v.bioIBAN, v.bioIBAN, seg.amount, SegmentService._now(), v.tvmClaimedThisYear, v.finalChainHash
-    );
-    const token = await CryptoService.encryptBioCatchNumber(plainBio);
-    const bioCatchText = document.getElementById("bioCatchNumberText");
-    bioCatchText.textContent = token.length > 12 ? token.slice(0, 12) + "..." : token;
-    bioCatchText.dataset.fullCatch = token;
-    document.getElementById("bioCatchSize").textContent = `Size: ${(token.length / 1024 / 1024).toFixed(2)} MB`;
-    generateQRCode(token);
-    openModal("bioCatchPopup");
-  }));
-
-  document.getElementById("copyBioCatchBtn")?.addEventListener("click", () => {
-    const bcTxt = document.getElementById("bioCatchNumberText");
-    copyToClipboard(bcTxt.dataset.fullCatch || bcTxt.textContent);
-  });
-
-  document.getElementById("closeBioCatchPopup")?.addEventListener("click", () => closeModal("bioCatchPopup"));
-
-  document.getElementById("claimTVMBtn")?.addEventListener("click", safeHandler(async () => {
-    if (!confirm("Claim available TVM tokens to your KYC’d wallet?")) return;
-    await TokenService.claimTvmTokens();
-    renderVaultUI();
-    toast("TVM tokens claimed successfully!");
-  }));
-
-  document.getElementById("exportBtn")?.addEventListener("click", safeHandler(async () => {
-    const v = VaultService.current;
-    if (!v) throw new Error("Vault locked");
-    const rows = [["Bio-IBAN", "Bio-Catch", "Proof", "Amount", "Date", "Status"]];
-    v.transactionHistory.forEach(tx => {
-      const proof = tx.bioCatch ? tx.bioCatch.slice(0, 8) + "..." : "N/A";
-      rows.push([
-        tx.type === "cashback" ? `Bonus #${tx.bonusId}` : (tx.to === v.deviceKeyHashes[0] ? tx.from : tx.to).slice(0, 10) + "…",
-        tx.bioCatch ? tx.bioCatch.slice(0, 8) + "..." : "—",
-        proof,
-        tx.amount,
-        new Date(tx.timestamp * 1000).toLocaleString(),
-        tx.status
-      ]);
+    tvmContract.on("SwapExecuted", (user, amount, direction, postRatio) => {
+      if (user.toLowerCase() === account.toLowerCase()) {
+        UI.showAlert(`Swap Executed: ${amount} ${direction}`);
+        Wallet.updateBalances();
+        Notifications.sendPush('Swap Executed', `${direction} swap of ${amount} completed`);
+      }
     });
-    const csv = "data:text/csv;charset=utf-8," + rows.map(r => r.join(",")).join("\n");
-    const a = Object.assign(document.createElement("a"), { href: encodeURI(csv), download: "transactions.csv" });
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    await AuditService.log("Transaction history exported", {});
-  }));
+    // Add other events
+  },
+  handleChainChanged: (newChainId) => {
+    chainId = Number(newChainId);
+    Wallet.initContracts();
+    Wallet.updateBalances();
+  },
+  handleAccountsChanged: (accounts) => {
+    account = accounts[0];
+    UI.updateConnectedAccount();
+    Wallet.updateBalances();
+  },
+  handleDisconnect: () => {
+    provider = null;
+    signer = null;
+    account = null;
+    UI.updateConnectedAccount();
+  }
+};
 
-  document.getElementById("exportBackupBtn")?.addEventListener("click", safeHandler(async () => {
-    const pwd = prompt("Backup password (≥8 chars):");
-    if (!pwd) return;
-    const data = await BackupService.exportEncryptedBackup(VaultService.current, pwd);
-    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = Object.assign(document.createElement("a"), { href: url, download: "vault_backup.enc.json" });
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    localStorage.setItem("vaultBackedUp", "yes");
-    showBackupReminder();
-    toast("Encrypted backup exported");
-  }));
+// P2P Module
+const P2P = {
+  handleCatchOut: async () => {
+    const amount = Utils.sanitizeInput(prompt("Enter amount of SHE to transfer:"));
+    const layer = Utils.sanitizeInput(prompt("Enter layer (1-10):"));
+    if (!amount || !layer || isNaN(amount) || isNaN(layer) || layer < 1 || layer > 10) return;
+    UI.showLoading('catchOut');
+    try {
+      const payload = await Proofs.generateBioCatch(parseInt(amount), parseInt(layer));
+      document.getElementById('bioCatchText').textContent = payload;
+      document.getElementById('bioCatchModal').classList.remove('hidden');
+      QRCode.toCanvas(document.getElementById('qrCode'), payload, err => err && console.error(err));
+      // NFC share if supported
+      if ('nfc' in navigator) {
+        try {
+          const nfc = new NDEFWriter();
+          await nfc.write({ records: [{ recordType: "text", data: payload }] });
+          UI.showAlert("Shared via NFC");
+        } catch (err) {
+          console.error("NFC write error:", err);
+        }
+      }
+      vaultData.balanceSHE -= parseInt(amount);
+      vaultData.layerBalances[parseInt(layer) - 1] -= parseInt(amount);
+      await Vault.promptAndSaveVault();
+    } catch (err) {
+      UI.showAlert("Catch Out failed: " + err.message);
+    } finally {
+      UI.hideLoading('catchOut');
+    }
+  },
+  handleCatchIn: async () => {
+    const payloadStr = Utils.sanitizeInput(prompt("Paste Bio-Catch payload:"));
+    if (!payloadStr) return;
+    UI.showLoading('catchIn');
+    try {
+      const payload = await Proofs.decryptBioCatch(payloadStr);
+      const valid = await Proofs.validateProofs(payload.proofs, payload.layer, payload.userBioConstant);
+      if (valid) {
+        vaultData.balanceSHE += payload.amount;
+        vaultData.layerBalances[payload.layer - 1] += payload.amount;
+        await Vault.promptAndSaveVault();
+        UI.showAlert("Catch In successful.");
+      } else {
+        UI.showAlert("Invalid payload.");
+      }
+    } catch (err) {
+      UI.showAlert("Invalid payload: " + err.message);
+    } finally {
+      UI.hideLoading('catchIn');
+    }
+  },
+  handleNfcRead: async () => {
+    if ('nfc' in navigator) {
+      try {
+        const nfc = new NDEFReader();
+        await nfc.scan();
+        nfc.onreading = (event) => {
+          const message = event.message;
+          for (const record of message.records) {
+            if (record.recordType === "text") {
+              P2P.handleCatchInPayload(record.data);
+            }
+          }
+        };
+      } catch (err) {
+        console.error("NFC read error:", err);
+      }
+    }
+  },
+  handleCatchInPayload: async (payloadStr) => {
+    // Similar to handleCatchIn but from NFC
+    // ...
+  }
+};
 
-  document.getElementById("exportFriendlyBtn")?.addEventListener("click", safeHandler(async () => {
-    BackupService.exportFriendly(VaultService.current);
-    localStorage.setItem("vaultBackedUp", "yes");
-    showBackupReminder();
-    toast("Friendly backup exported");
-  }));
+// Notifications Module
+const Notifications = {
+  requestPermission: async () => {
+    if (Notification.permission !== 'granted') {
+      await Notification.requestPermission();
+    }
+  },
+  sendPush: (title, body) => {
+    if (Notification.permission === 'granted') {
+      navigator.serviceWorker.ready.then(reg => {
+        reg.showNotification(title, { body });
+      });
+    }
+  }
+};
 
-  document.getElementById("importVaultFileInput")?.addEventListener("change", safeHandler(async e => {
-    const f = e.target.files[0];
-    if (!f) return;
-    const txt = await f.text();
-    const payload = JSON.parse(txt);
-    const pwd = prompt("Enter backup password:");
-    if (!pwd) return;
-    const vault = await BackupService.importEncryptedBackup(payload, pwd);
-    VaultService._session = { vaultData: vault, key: null, salt: null };
-    await VaultService.persist();
-    renderVaultUI();
-    toast("Vault imported");
-  }));
+// UI Module
+const UI = {
+  showAlert: (msg) => alert(msg),
+  showLoading: (id) => {
+    const loadingEl = document.getElementById(`${id}-loading`);
+    if (loadingEl) loadingEl.style.display = 'block';
+  },
+  hideLoading: (id) => {
+    const loadingEl = document.getElementById(`${id}-loading`);
+    if (loadingEl) loadingEl.style.display = 'none';
+  },
+  updateConnectedAccount: () => {
+    document.getElementById('connectedAccount').textContent = account || 'Not connected';
+  }
+};
 
-  document.getElementById("installA2HSBtn")?.addEventListener("click", promptInstallA2HS);
+// Contract Interaction Module
+const ContractInteractions = {
+  claimTVM: async () => {
+    UI.showLoading('claim');
+    try {
+      const proofsStr = Utils.sanitizeInput(document.getElementById('claim-proofs').value);
+      const deviceKeyHash = Utils.sanitizeInput(document.getElementById('claim-device-key-hash').value);
+      const userBioConstant = Utils.sanitizeInput(document.getElementById('claim-user-bio-constant').value);
+      const nonce = Utils.sanitizeInput(document.getElementById('claim-nonce').value);
+      const signature = Utils.sanitizeInput(document.getElementById('claim-signature').value);
+      const proofs = JSON.parse(proofsStr);
+      const gasEstimate = await tvmContract.claimTVM.estimateGas(proofs, signature, deviceKeyHash, userBioConstant, nonce);
+      const tx = await tvmContract.claimTVM(proofs, signature, deviceKeyHash, userBioConstant, nonce, { gasLimit: gasEstimate * 120n / 100n });
+      await tx.wait();
+      UI.showAlert('Claim successful.');
+      Wallet.updateBalances();
+    } catch (err) {
+      console.error(err);
+      UI.showAlert('Error claiming TVM: ' + (err.reason || err.message));
+    } finally {
+      UI.hideLoading('claim');
+    }
+  },
+  generateClaimSignature: async () => {
+    try {
+      const proofsStr = Utils.sanitizeInput(document.getElementById('claim-proofs').value);
+      const deviceKeyHash = Utils.sanitizeInput(document.getElementById('claim-device-key-hash').value);
+      const userBioConstant = Number(Utils.sanitizeInput(document.getElementById('claim-user-bio-constant').value));
+      const nonce = Number(Utils.sanitizeInput(document.getElementById('claim-nonce').value));
+      const proofs = JSON.parse(proofsStr);
+      const signature = await Proofs.signClaim(proofs, deviceKeyHash, userBioConstant, nonce);
+      document.getElementById('claim-signature').value = signature;
+    } catch (err) {
+      UI.showAlert('Signature generation failed: ' + err.message);
+    }
+  },
+  // Similar for exchange, swap, transfer with gas estimate, error parse
+  exchangeTVMForSegments: async () => {
+    // Implement similar to claim
+  },
+  // ...
+};
 
-  document.getElementById("saveWalletBtn")?.addEventListener("click", safeHandler(async () => {
-    const addr = document.getElementById("userWalletAddress").value.trim();
-    if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) throw new Error("Bad address");
-    const v = VaultService.current;
-    v.walletAddressKYC = addr;
-    await VaultService.persist();
-    toast("KYC’d wallet address saved");
-    await AuditService.log("Wallet address saved", { address: addr });
-  }));
+// Init Function
+async function init() {
+  Notifications.requestPermission();
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').then(reg => {
+      console.log('SW registered');
+    }).catch(err => console.error('SW registration failed', err));
+  }
+  P2P.handleNfcRead(); // Start NFC listening if supported
 
-  document.getElementById("autoConnectWalletBtn")?.addEventListener("click", safeHandler(async () => {
-    ChainService.initWeb3();
-    await window.ethereum?.request({ method: "eth_requestAccounts" });
-    const signer = ChainService.getSigner();
-    const addr = signer ? await signer.getAddress() : "";
-    if (addr) {
-      document.getElementById("userWalletAddress").value = addr;
-      document.getElementById("saveWalletBtn").click();
-    } else toast("Wallet connect failed", true);
-  }));
+  const stored = await DB.loadVaultDataFromDB();
+  if (stored) {
+    vaultData.authAttempts = stored.authAttempts;
+    vaultData.lockoutTimestamp = stored.lockoutTimestamp;
+  } else {
+    const credential = await Biometric.performBiometricAuthenticationForCreation();
+    if (credential) {
+      vaultData.credentialId = Encryption.bufferToBase64(credential.rawId);
+      vaultData.bioIBAN = await Utils.sha256Hex(Math.random().toString());
+      vaultData.joinTimestamp = Date.now();
+      vaultData.deviceKeyHash = await Utils.sha256Hex(KEY_HASH_SALT + Utils.toB64(Utils.rand(32)));
+      vaultData.balanceSHE = INITIAL_BALANCE_SHE;
+      const salt = Utils.rand(16);
+      const pin = Utils.sanitizeInput(prompt("Set passphrase:"));
+      derivedKey = await Vault.deriveKeyFromPIN(pin, salt);
+      await Vault.promptAndSaveVault(salt);
+    }
+  }
 
-  document.getElementById("exportComplianceBtn")?.addEventListener("click", safeHandler(async () => {
-    AuditService.exportComplianceReport(VaultService.current);
-    toast("Compliance report exported");
-  }));
-
-  document.getElementById("catchOutAmount")?.addEventListener("input", e => {
-    const amt = Number(e.target.value);
-    if (amt > 10000) toast("Large transfers (>10,000 segments) may take time.", true);
-  });
-
-  document.getElementById("auditPegLive").innerHTML = `1 TVM = 12 SHE = 1 USD (Protocol-Pegged). Last Audit: ${new Date().toLocaleString()}`;
-
-  // Modal Navigation Buttons
-  document.querySelectorAll(".explainer-links button, .modal-nav button").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const modalId = btn.getAttribute("onclick")?.match(/'([^']+)'/)?.[1];
-      if (modalId) openModal(modalId);
-    });
-  });
-
-  // Transaction Pagination
-  document.getElementById("txPrevBtn")?.addEventListener("click", () => {
-    if (transactionPage > 0) {
-      transactionPage--;
-      renderTransactions();
+  // Event listeners
+  document.getElementById('connectMetaMaskBtn').addEventListener('click', Wallet.connectMetaMask);
+  document.getElementById('connectWalletConnectBtn').addEventListener('click', Wallet.connectWalletConnect);
+  document.getElementById('enterVaultBtn').addEventListener('click', async () => {
+    if (vaultData.lockoutTimestamp && Date.now() < vaultData.lockoutTimestamp + LOCKOUT_DURATION_SECONDS * 1000) {
+      UI.showAlert("Vault locked out.");
+      return;
+    }
+    const pin = Utils.sanitizeInput(prompt("Enter passphrase:"));
+    const stored = await DB.loadVaultDataFromDB();
+    if (stored) {
+      derivedKey = await Vault.deriveKeyFromPIN(pin, stored.salt);
+      try {
+        vaultData = await Encryption.decryptData(derivedKey, stored.iv, stored.ciphertext);
+        if (await Biometric.performBiometricAssertion(vaultData.credentialId)) {
+          vaultUnlocked = true;
+          document.getElementById('lockedScreen').classList.add('hidden');
+          document.getElementById('vaultUI').classList.remove('hidden');
+          Vault.updateVaultUI();
+        } else {
+          vaultData.authAttempts++;
+          if (vaultData.authAttempts >= MAX_AUTH_ATTEMPTS) {
+            vaultData.lockoutTimestamp = Date.now();
+          }
+          await Vault.promptAndSaveVault();
+          UI.showAlert("Biometric failed.");
+        }
+      } catch (err) {
+        UI.showAlert("Invalid passphrase.");
+      }
     }
   });
 
-  document.getElementById("txNextBtn")?.addEventListener("click", () => {
-    transactionPage++;
-    renderTransactions();
-  });
+  document.getElementById('lockVaultBtn').addEventListener('click', Vault.lockVault);
+  document.getElementById('catchOutBtn').addEventListener('click', P2P.handleCatchOut);
+  document.getElementById('catchInBtn').addEventListener('click', P2P.handleCatchIn);
+  document.getElementById('generate-claim-signature-btn').addEventListener('click', ContractInteractions.generateClaimSignature);
+  document.getElementById('claim-tvm-btn').addEventListener('click', ContractInteractions.claimTVM);
+  // Add other listeners similarly
 
-  // Initialize
-  showOnboardingIfNeeded();
-  showBackupReminder();
-  renderVaultUI();
-})();
+  setTimeout(Vault.lockVault, MAX_IDLE);
+  setInterval(() => {
+    document.getElementById('utcTime').textContent = new Date().toUTCString();
+  }, 1000);
+}
 
-/*──────────────────────── 22. EXPORTS ─────────────────────────────*/
-window.safeHandler = safeHandler;
-window.openModal = openModal;
-window.closeModal = closeModal;
-window.modalNav = modalNav;
-window.showToast = toast;
-window.showBackupReminder = showBackupReminder;
-window.renderVaultUI = renderVaultUI;
-window.renderTransactions = renderTransactions;
+init();
