@@ -1,5 +1,5 @@
-// sw.js
-importScripts('https://storage.googleapis.com/workbox-cdn/releases/6.5.4/workbox-sw.js');
+// sw.js (Full from Previous, Updated for Workbox v7 as of 2025)
+importScripts('https://storage.googleapis.com/workbox-cdn/releases/7.1.0/workbox-sw.js');
 
 workbox.routing.registerRoute(
   ({request}) => request.mode === 'navigate',
@@ -30,20 +30,20 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
-// Background sync for transactions and P2P payloads
+// Background Sync for Transactions
 const bgSyncPlugin = new workbox.backgroundSync.BackgroundSyncPlugin('txQueue', {
   maxRetentionTime: 24 * 60 // Retry for 24 hours
 });
 
 workbox.routing.registerRoute(
-  new RegExp('/api/tx/'), // Placeholder for tx endpoint if relay used
+  new RegExp('/api/tx/'), // If using relay
   new workbox.strategies.NetworkOnly({
     plugins: [bgSyncPlugin]
   }),
   'POST'
 );
 
-// Push notifications handler
+// Push Notifications
 self.addEventListener('push', (event) => {
   const data = event.data.json();
   const options = {
