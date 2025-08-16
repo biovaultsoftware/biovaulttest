@@ -283,7 +283,10 @@ const Biometric = {
           challenge: Utils.rand(32),
           rp: { name: "BioVault" },
           user: { id: Utils.rand(16), name: "user@biovault", displayName: "User" },
-          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+          pubKeyCredParams: [
+          { type: "public-key", alg: -7 },
+          { type: "public-key", alg: -257 }
+        ],
           authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" }
         }
       });
