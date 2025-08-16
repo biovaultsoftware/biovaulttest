@@ -7,11 +7,7 @@
  * Best Practices: Error handling, gas optimization, secure biometrics, idle timeouts, sanitization, mobile-responsive, PWA standards, accessibility (aria labels), no uncaught errors.
  * Buttons disabled until wallet connected; Transfer TVM replaced with Swap USDT to TVM; No refill layers.
  * Fixed: Enter vault passphrase prompt, connect wallet functionality (MetaMask/WalletConnect).
- * Added: P2P segments transfer (Catch In/Out) with micro-ledger per segment (10 history events), ZKP for biometric human validation, validation on receive, update balance/transaction history if valid.
- * Segment balance = sum of segments with current owner = vault owner.
- * Bio-Catch payload = transferred segments with updated history and ZKP.
- * P2P system more secure than blockchain with micro-ledger integrity.
- * Paramkeys updated to include -7 and -257 for broader device support.
+ * Added: P2P segments transfer (Catch In/Out) with micro-ledger per segment (10 history events), ZKP for biometric human validation, validation on receive, update balance/transaction history.
  ******************************/
 
 // Base Setup / Global Constants (From main.js, Updated for 2025 Standards)
@@ -202,7 +198,7 @@ const Encryption = {
   base64ToBuffer: (b64) => Utils.fromB64(b64)
 };
 
-// DB Module
+// DB Module (Added SEGMENTS_STORE)
 const DB = {
   openVaultDB: async () => {
     return new Promise((resolve, reject) => {
