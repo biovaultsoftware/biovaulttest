@@ -5,7 +5,8 @@
  * Superiority: Instant Offline Transfers, Zero Fees, Full Traceability, Human-Centric (51% HI Rule)
  * Updated: Blockchain buttons auto-populate from BalanceChain proofs (no manual forms); MSL section no SCL mention; SCL generalized for any currency; Whitepaper updated for dynamic pricing/fixed SHE.
  * Best Practices: Error handling, gas optimization, secure biometrics, idle timeouts, sanitization, mobile-responsive, PWA standards, accessibility (aria labels), no uncaught errors.
- * Buttons disabled until wallet connected; Transfer TVM replaced with Swap USDT to TVM; Refill layers removed.
+ * Buttons disabled until wallet connected; Transfer TVM replaced with Swap USDT to TVM; No refill layers.
+ * Fixed: Enter vault passphrase prompt, connect wallet functionality (MetaMask/WalletConnect).
  ******************************/
 
 // Base Setup / Global Constants (From main.js, Updated for 2025 Standards)
@@ -283,10 +284,7 @@ const Biometric = {
           challenge: Utils.rand(32),
           rp: { name: "BioVault" },
           user: { id: Utils.rand(16), name: "user@biovault", displayName: "User" },
-          pubKeyCredParams: [
-          { type: "public-key", alg: -7 },
-          { type: "public-key", alg: -257 }
-        ],
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
           authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" }
         }
       });
@@ -370,6 +368,8 @@ const Wallet = {
       Wallet.initContracts();
       Wallet.updateBalances();
       enableDashboardButtons();
+      document.getElementById('connect-wallet').textContent = 'Wallet Connected';
+      document.getElementById('connect-wallet').disabled = true;
     } else {
       alert('Install MetaMask.');
     }
@@ -391,6 +391,8 @@ const Wallet = {
     Wallet.initContracts();
     Wallet.updateBalances();
     enableDashboardButtons();
+    document.getElementById('connect-wallet').textContent = 'Wallet Connected';
+    document.getElementById('connect-wallet').disabled = true;
   },
   initContracts: () => {
     tvmContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
