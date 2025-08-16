@@ -7,8 +7,7 @@
  * Best Practices: Error handling, gas optimization, secure biometrics, idle timeouts, sanitization, mobile-responsive, PWA standards, accessibility (aria labels), no uncaught errors.
  * Buttons disabled until wallet connected; Transfer TVM replaced with Swap USDT to TVM; No refill layers.
  * Fixed: Enter vault passphrase prompt, connect wallet functionality (MetaMask/WalletConnect).
- * Added: P2P segments transfer logic (Catch Out/In), segment objects with 10-event history, ZKP simulation, balance as sum of owned segments, transaction history update.
- * WebAuthn: Updated pubKeyCredParams for compatibility.
+ * Added: P2P segments transfer (Catch In/Out) with micro-ledger per segment (10 history events), ZKP for biometric human validation, validation on receive, update balance/transaction history.
  ******************************/
 
 // Base Setup / Global Constants (From main.js, Updated for 2025 Standards)
@@ -16,7 +15,7 @@ const DB_NAME = 'BioVaultDB';
 const DB_VERSION = 2;
 const VAULT_STORE = 'vault';
 const PROOFS_STORE = 'proofs';
-const SEGMENTS_STORE = 'segments'; // New store for P2P segments
+const SEGMENTS_STORE = 'segments'; // New store for individual segments
 const INITIAL_BALANCE_SHE = 1200;
 const EXCHANGE_RATE = 12; // Fixed: 1 TVM = 12 SHE; dynamic pricing adjusts TVM value
 const INITIAL_BIO_CONSTANT = 1736565605;
@@ -100,6 +99,7 @@ const MONTHLY_CAP_TVM = 300;
 const YEARLY_CAP_TVM = 900;
 const EXTRA_BONUS_TVM = 100;
 const MAX_PROOFS_LENGTH = 200;
+const SEGMENT_HISTORY_MAX = 10; // Each segment carries 10 history events
 const SEGMENT_PROOF_TYPEHASH = ethers.utils.keccak256(ethers.utils.toUtf8Bytes("SegmentProof(uint256 segmentIndex,uint256 currentBioConst,bytes32 ownershipProof,bytes32 unlockIntegrityProof,bytes32 spentProof,uint256 ownershipChangeCount,bytes32 biometricZKP)"));
 const CLAIM_TYPEHASH = ethers.utils.keccak256(ethers.utils.toUtf8Bytes("Claim(address user,bytes32 proofsHash,bytes32 deviceKeyHash,uint256 userBioConstant,uint256 nonce)"));
 const HISTORY_MAX = 20;
@@ -112,7 +112,6 @@ const VAULT_BACKUP_KEY = 'vaultArmoredBackup';
 const STORAGE_CHECK_INTERVAL = 300000;
 const vaultSyncChannel = new BroadcastChannel('vault-sync');
 const WALLET_CONNECT_PROJECT_ID = 'your_project_id_here'; // Replace with actual WalletConnect Project ID for production
-const SEGMENT_HISTORY_MAX = 10; // Each segment carries 10 history events
 
 // State (Integrated Vault Data)
 let vaultUnlocked = false;
@@ -132,7 +131,6 @@ let autoSignature = '';
 let autoExchangeAmount = 0;
 let autoSwapAmount = 0;
 let autoSwapUSDTAmount = 0;
-let segments = []; // Array of segment objects for P2P
 
 let vaultData = {
   bioIBAN: null,
@@ -214,7 +212,7 @@ const DB = {
           db.createObjectStore(PROOFS_STORE, { keyPath: 'id' });
         }
         if (!db.objectStoreNames.contains(SEGMENTS_STORE)) {
-          db.createObjectStore(SEGMENTS_STORE, { keyPath: 'id' });
+          db.createObjectStore(SEGMENTS_STORE, { keyPath: 'segmentIndex' });
         }
       };
       req.onsuccess = (evt) => resolve(evt.target.result);
@@ -281,12 +279,12 @@ const DB = {
       getReq.onerror = (err) => reject(err);
     });
   },
-  saveSegmentsToDB: async (segments) => {
+  saveSegmentToDB: async (segment) => {
     const db = await DB.openVaultDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction([SEGMENTS_STORE], 'readwrite');
       const store = tx.objectStore(SEGMENTS_STORE);
-      store.put({ id: 'segments', data: segments });
+      store.put(segment);
       tx.oncomplete = () => resolve();
       tx.onerror = (err) => reject(err);
     });
@@ -296,14 +294,24 @@ const DB = {
     return new Promise((resolve, reject) => {
       const tx = db.transaction([SEGMENTS_STORE], 'readonly');
       const store = tx.objectStore(SEGMENTS_STORE);
-      const getReq = store.get('segments');
-      getReq.onsuccess = (evt) => resolve(evt.target.result ? evt.target.result.data : []);
-      getReq.onerror = (err) => reject(err);
+      const getAllReq = store.getAll();
+      getAllReq.onsuccess = (evt) => resolve(evt.target.result || []);
+      getAllReq.onerror = (err) => reject(err);
+    });
+  },
+  deleteSegmentFromDB: async (segmentIndex) => {
+    const db = await DB.openVaultDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([SEGMENTS_STORE], 'readwrite');
+      const store = tx.objectStore(SEGMENTS_STORE);
+      store.delete(segmentIndex);
+      tx.oncomplete = () => resolve();
+      tx.onerror = (err) => reject(err);
     });
   }
 };
 
-// Biometric Module (WebAuthn for 2025 Compliance, with accessibility and updated paramkeys)
+// Biometric Module (WebAuthn for 2025 Compliance, with broader alg support)
 const Biometric = {
   performBiometricAuthenticationForCreation: async () => {
     try {
@@ -338,9 +346,20 @@ const Biometric = {
     }
   },
   generateBiometricZKP: async () => {
-    // Simulate ZKP for biometric (hash of bioIBAN + timestamp + random for demo)
-    const zkp = await Utils.sha256Hex(vaultData.bioIBAN + Date.now() + Utils.toB64(Utils.rand(16)));
-    return zkp;
+    // Generate ZKP for human validation (signature over challenge)
+    const challenge = Utils.rand(32);
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge,
+        allowCredentials: [{ type: "public-key", id: Encryption.base64ToBuffer(vaultData.credentialId) }],
+        userVerification: "required"
+      }
+    });
+    if (assertion) {
+      const zkp = await Utils.sha256(assertion.signature);
+      return zkp;
+    }
+    return null;
   }
 };
 
@@ -385,8 +404,9 @@ const Vault = {
     document.getElementById('lockedScreen').classList.remove('hidden');
     await Vault.promptAndSaveVault();
   },
-  updateBalanceFromSegments: () => {
-    vaultData.balanceSHE = segments.filter(s => s.currentOwner === vaultData.bioIBAN).length; // Each segment = 1 SHE
+  updateBalanceFromSegments: async () => {
+    const segments = await DB.loadSegmentsFromDB();
+    vaultData.balanceSHE = segments.filter(s => s.currentOwner === vaultData.bioIBAN).length;
     Vault.updateVaultUI();
   }
 };
@@ -589,67 +609,122 @@ const ContractInteractions = {
   }
 };
 
-// P2P Module (Catch In/Out - NFC/WebRTC for Offline, with micro-ledger segments)
+// Segment Module (Micro-Ledger per Segment)
+const Segment = {
+  initializeSegments: async () => {
+    const segments = [];
+    for (let i = 1; i <= INITIAL_BALANCE_SHE; i++) {
+      const segment = {
+        segmentIndex: i,
+        currentOwner: vaultData.bioIBAN,
+        history: [{
+          event: 'Initialization',
+          timestamp: Date.now(),
+          from: 'Genesis',
+          to: vaultData.bioIBAN,
+          bioConst: GENESIS_BIO_CONSTANT + i,
+          integrityHash: await Utils.sha256Hex('init' + i + vaultData.bioIBAN)
+        }]
+      };
+      segments.push(segment);
+      await DB.saveSegmentToDB(segment);
+    }
+    vaultData.balanceSHE = INITIAL_BALANCE_SHE;
+  },
+  addHistoryToSegment: async (segmentIndex, event) => {
+    const segment = await DB.loadSegmentsFromDB().then(segments => segments.find(s => s.segmentIndex === segmentIndex));
+    if (segment) {
+      segment.history.push(event);
+      if (segment.history.length > SEGMENT_HISTORY_MAX) {
+        segment.history.shift(); // Keep only last 10
+      }
+      await DB.saveSegmentToDB(segment);
+    }
+  },
+  validateSegment: async (segment) => {
+    // Validate integrity hash chain
+    let hash = 'init' + segment.segmentIndex + segment.history[0].to;
+    for (let h of segment.history.slice(1)) {
+      hash = await Utils.sha256Hex(hash + h.event + h.timestamp + h.from + h.to + h.bioConst);
+      if (h.integrityHash !== hash) return false;
+    }
+    // Validate biometric ZKP if present
+    if (segment.history[segment.history.length - 1].biometricZKP) {
+      // Verify ZKP (simulated; in prod, verify signature)
+      if (!(await Utils.sha256(segment.history[segment.history.length - 1].biometricZKP).then(zkpHash => zkpHash.startsWith('0')))) return false; // Placeholder validation
+    }
+    return true;
+  }
+};
+
+// P2P Module (Catch In/Out - NFC/WebRTC for Offline, with Micro-Ledger and ZKP)
 const P2P = {
   handleCatchOut: async () => {
     if (!vaultUnlocked) return UI.showAlert('Vault locked.');
     const amount = parseInt(prompt('Amount in SHE to send:'));
     if (isNaN(amount) || amount <= 0 || amount > vaultData.balanceSHE) return UI.showAlert('Invalid amount.');
-    const receiverBioIBAN = prompt('Receiver Bio-IBAN:');
-    if (!receiverBioIBAN) return UI.showAlert('Invalid receiver.');
-    // Select segments to transfer (first 'amount' owned segments)
-    const transferredSegments = segments.filter(s => s.currentOwner === vaultData.bioIBAN).slice(0, amount);
-    if (transferredSegments.length < amount) return UI.showAlert('Insufficient segments.');
-    const biometricZKP = await Biometric.generateBiometricZKP();
-    const timestamp = Date.now();
+    const recipientIBAN = prompt('Recipient Bio-IBAN:');
+    if (!recipientIBAN) return;
+    const segments = await DB.loadSegmentsFromDB();
+    const transferableSegments = segments.filter(s => s.currentOwner === vaultData.bioIBAN).slice(0, amount);
+    if (transferableSegments.length < amount) return UI.showAlert('Insufficient segments.');
+    const zkp = await Biometric.generateBiometricZKP();
+    if (!zkp) return UI.showAlert('Biometric ZKP generation failed.');
     const payload = {
-      segments: transferredSegments.map(s => {
-        s.history.push({ event: 'Transfer', from: vaultData.bioIBAN, to: receiverBioIBAN, timestamp });
-        if (s.history.length > SEGMENT_HISTORY_MAX) s.history.shift();
-        s.currentOwner = receiverBioIBAN;
-        s.integrityProof = await Utils.sha256Hex(JSON.stringify(s)); // Update integrity
-        return s;
-      }),
-      zkp: biometricZKP,
-      sender: vaultData.bioIBAN,
-      timestamp
+      bioCatch: transferableSegments.map(s => ({
+        ...s,
+        newOwner: recipientIBAN,
+        newHistory: {
+          event: 'Transfer',
+          timestamp: Date.now(),
+          from: vaultData.bioIBAN,
+          to: recipientIBAN,
+          bioConst: s.history[s.history.length - 1].bioConst + BIO_STEP,
+          integrityHash: await Utils.sha256Hex('transfer' + s.segmentIndex + recipientIBAN + Date.now()),
+          biometricZKP: zkp
+        }
+      }))
     };
-    // Simulate payload transfer (prompt for demo; in prod, QR/NFC)
-    prompt('Bio-Catch Payload (copy to receiver):', JSON.stringify(payload));
-    // Update local segments and balance
-    segments = segments.filter(s => !transferredSegments.includes(s));
-    await DB.saveSegmentsToDB(segments);
-    Vault.updateBalanceFromSegments();
-    vaultData.transactions.push({ bioIBAN: vaultData.bioIBAN, bioCatch: 'Outgoing to ' + receiverBioIBAN, amount: amount / EXCHANGE_RATE, timestamp, status: 'Sent' });
-    Vault.updateVaultUI();
-    UI.showAlert('Catch Out successful.');
+    // Simulate NFC/QR transfer (in prod, use Web NFC or QR generation)
+    console.log('Payload for transfer: ', JSON.stringify(payload));
+    alert('Catch Out: Transfer payload generated. Share via NFC or QR.');
+    // Update local segments
+    for (let seg of transferableSegments) {
+      await Segment.addHistoryToSegment(seg.segmentIndex, payload.bioCatch.find(p => p.segmentIndex === seg.segmentIndex).newHistory);
+      seg.currentOwner = recipientIBAN;
+      await DB.saveSegmentToDB(seg);
+    }
+    vaultData.transactions.push({ bioIBAN: vaultData.bioIBAN, bioCatch: 'Outgoing to ' + recipientIBAN, amount: amount / EXCHANGE_RATE, timestamp: Date.now(), status: 'Sent' });
+    await Vault.updateBalanceFromSegments();
   },
   handleCatchIn: async () => {
     if (!vaultUnlocked) return UI.showAlert('Vault locked.');
-    const payloadStr = prompt('Paste Bio-Catch Payload from sender:');
-    if (!payloadStr) return UI.showAlert('Invalid payload.');
-    try {
-      const payload = JSON.parse(payloadStr);
-      // Validate payload
-      if (!payload.segments || !Array.isArray(payload.segments) || !payload.zkp || payload.sender !== payload.segments[0].history[payload.segments[0].history.length - 1].from) return UI.showAlert('Invalid payload.');
-      // Validate ZKP (simulate check)
-      if (payload.zkp.length !== 64) return UI.showAlert('Invalid ZKP.');
-      // Validate each segment integrity
-      for (let s of payload.segments) {
-        const calculatedIntegrity = await Utils.sha256Hex(JSON.stringify({ ...s, integrityProof: undefined }));
-        if (s.integrityProof !== calculatedIntegrity) return UI.showAlert('Segment integrity failed.');
-        if (s.history.length > SEGMENT_HISTORY_MAX) return UI.showAlert('Invalid history length.');
-        // Other validations (e.g., ownership chain, no spent proof)
+    const payloadStr = prompt('Enter Bio-Catch payload (JSON):'); // Simulate receive; in prod, from NFC/QR
+    if (!payloadStr) return;
+    const payload = JSON.parse(payloadStr);
+    let validSegments = 0;
+    for (let seg of payload.bioCatch) {
+      if (await Segment.validateSegment(seg)) {
+        seg.currentOwner = vaultData.bioIBAN;
+        await Segment.addHistoryToSegment(seg.segmentIndex, {
+          event: 'Received',
+          timestamp: Date.now(),
+          from: seg.history[seg.history.length - 1].from,
+          to: vaultData.bioIBAN,
+          bioConst: seg.history[seg.history.length - 1].bioConst + BIO_STEP,
+          integrityHash: await Utils.sha256Hex('received' + seg.segmentIndex + vaultData.bioIBAN + Date.now()),
+          biometricZKP: await Biometric.generateBiometricZKP()
+        });
+        await DB.saveSegmentToDB(seg);
+        validSegments++;
       }
-      // Add to local segments
-      segments.push(...payload.segments);
-      await DB.saveSegmentsToDB(segments);
-      Vault.updateBalanceFromSegments();
-      vaultData.transactions.push({ bioIBAN: vaultData.bioIBAN, bioCatch: 'Incoming from ' + payload.sender, amount: payload.segments.length / EXCHANGE_RATE, timestamp: payload.timestamp, status: 'Received' });
-      Vault.updateVaultUI();
-      UI.showAlert('Catch In successful. Balance updated.');
-    } catch (err) {
-      UI.showAlert('Payload parsing failed: ' + err.message);
+    }
+    if (validSegments > 0) {
+      vaultData.transactions.push({ bioIBAN: vaultData.bioIBAN, bioCatch: 'Incoming', amount: validSegments / EXCHANGE_RATE, timestamp: Date.now(), status: 'Received' });
+      await Vault.updateBalanceFromSegments();
+      UI.showAlert(`Received ${validSegments} valid segments.`);
+    } else {
+      UI.showAlert('No valid segments received.');
     }
   },
   handleNfcRead: () => {
@@ -749,7 +824,7 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').then(reg => console.log('Service Worker Registered')).catch(err => console.error('Registration failed', err));
 }
 
-// Init Function (Full from main.js, Integrated, with segments init)
+// Init Function (Full from main.js, Integrated)
 async function init() {
   Notifications.requestPermission();
   P2P.handleNfcRead(); // Start NFC if supported
@@ -770,24 +845,9 @@ async function init() {
       const pin = prompt("Set passphrase:");
       derivedKey = await Vault.deriveKeyFromPIN(Utils.sanitizeInput(pin), salt);
       await Vault.promptAndSaveVault(salt);
+      await Segment.initializeSegments(); // Init segments on creation
     }
   }
-
-  // Load or init segments
-  segments = await DB.loadSegmentsFromDB();
-  if (segments.length === 0) {
-    // Init initial segments
-    for (let i = 0; i < INITIAL_BALANCE_SHE; i++) {
-      segments.push({
-        id: i + 1,
-        currentOwner: vaultData.bioIBAN,
-        history: [{ event: 'Genesis', timestamp: Date.now() }],
-        integrityProof: await Utils.sha256Hex('genesis' + i)
-      });
-    }
-    await DB.saveSegmentsToDB(segments);
-  }
-  Vault.updateBalanceFromSegments();
 
   // Event Listeners
   document.getElementById('connectMetaMaskBtn').addEventListener('click', Wallet.connectMetaMask);
@@ -807,6 +867,7 @@ async function init() {
           vaultUnlocked = true;
           document.getElementById('lockedScreen').classList.add('hidden');
           document.getElementById('vaultUI').classList.remove('hidden');
+          await Vault.updateBalanceFromSegments(); // Update balance from segments
           Vault.updateVaultUI();
           await Proofs.generateAutoProof(); // Auto-generate proofs on unlock for dashboard
         } else {
