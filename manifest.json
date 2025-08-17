@@ -1,7 +1,7 @@
 {
   "name": "Bio-Vault | BalanceChain | TVM",
   "short_name": "BioVault",
-  "description": "Audit-proof, pegged, human-effort digital money vault. 1 TVM = 1 USD. BalanceChain protocol.",
+  "description": "Audit-proof, pegged, human-effort digital money vault. 1 TVM = 12 SHE (fixed; dynamic pricing). BalanceChain protocol: Decentralized MSL and Centralized SCL versions. Superior to blockchain with instant offline P2P.",
   "start_url": "./index.html",
   "display": "standalone",
   "background_color": "#2f4979",
