@@ -821,7 +821,7 @@ function enableDashboardButtons() {
 
 // PWA Service Worker Registration
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').then(reg => console.log('Service Worker Registered')).catch(err => console.error('Registration failed', err));
+  navigator.serviceWorker.register('sw.js').then(reg => console.log('Service Worker Registered')).catch(err => console.error('Registration failed', err));
 }
 
 // Init Function (Full from main.js, Integrated)
