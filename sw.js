@@ -1,6 +1,6 @@
 // sw.js (Full from Previous, Updated for Workbox v7 as of 2025)
 importScripts('https://storage.googleapis.com/workbox-cdn/releases/7.1.0/workbox-sw.js');
-
+ 
 workbox.routing.registerRoute(
   ({request}) => request.mode === 'navigate',
   new workbox.strategies.NetworkFirst()
