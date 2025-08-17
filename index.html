@@ -15,7 +15,7 @@
     <!-- DOMPurify for Sanitization -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
     <!-- PWA Manifest (updated with real icons) -->
-    <link rel="manifest" href="manifest.json">
+    <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#007bff">
     <style>
         body { font-family: 'Roboto', sans-serif; background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); color: #ffffff; transition: background 0.3s; }
@@ -59,6 +59,7 @@
             </div>
         </div>
     </nav>
+
     <!-- Landing Page Section -->
     <section id="landing" class="section landing active-section fade-in">
         <div class="container">
@@ -77,6 +78,7 @@
             </div>
         </div>
     </section>
+
     <!-- BioVault PWA Section (Decentralized MSL - Offchain) -->
     <section id="biovault" class="section container fade-in">
         <h2 class="neon-text">BioVault PWA - Decentralized MSL (Micro Segments Ledger)</h2>
@@ -123,6 +125,7 @@
         <button class="btn btn-info btn-lg w-100 mt-4" onclick="exportProofToBlockchain()"><i class="fas fa-upload me-2"></i> Export Proof to Blockchain Dashboard</button>
         <button class="btn btn-outline-light back-btn w-100" onclick="showSection('landing')"><i class="fas fa-arrow-left me-2"></i> Back</button>
     </section>
+
     <!-- Centralized SCL Overview Section -->
     <section id="scl" class="section container fade-in">
         <h2 class="neon-text">Centralized SCL (Serial Centric Ledger) Overview</h2>
@@ -142,6 +145,7 @@
         </div>
         <button class="btn btn-outline-light back-btn w-100" onclick="showSection('landing')"><i class="fas fa-arrow-left me-2"></i> Back</button>
     </section>
+
     <!-- Blockchain Dashboard Section (Onchain - TVM Gateway, Buttons Only with Auto-Forms from BalanceChain) -->
     <section id="dashboard" class="section container fade-in">
         <h2 class="neon-text">TVM Blockchain Dashboard (Gateway to DLT)</h2>
@@ -234,6 +238,7 @@
         </table>
         <button class="btn btn-outline-light back-btn w-100" onclick="showSection('landing')"><i class="fas fa-arrow-left me-2"></i> Back</button>
     </section>
+
     <script src="main.js"></script>
     <!-- Bootstrap JS -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
