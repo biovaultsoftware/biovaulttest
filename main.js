@@ -136,7 +136,7 @@ let autoSignature = '';
 let autoExchangeAmount = 0;
 let autoSwapAmount = 0;
 let autoSwapUSDTAmount = 0;
-let transactionLock = false;               // prevent concurrent Catch In/Out
+let transactionLock = false; // prevent concurrent Catch In/Out
 const SESSION_URL_KEY = 'last_session_url';
 const VAULT_UNLOCKED_KEY = 'vaultUnlocked';
 const VAULT_LOCK_KEY = 'vaultLock';
@@ -541,6 +541,7 @@ const Proofs = {
     const ownershipChangeCount = 0;
     const biometricZKP = await Biometric.generateBiometricZKP();
     if (!biometricZKP) throw new Error('Biometric ZKP generation failed or was denied.');
+
     autoProofs = [{ segmentIndex, currentBioConst, ownershipProof, unlockIntegrityProof, spentProof, ownershipChangeCount, biometricZKP }];
     autoDeviceKeyHash = vaultData.deviceKeyHash;
     autoUserBioConstant = currentBioConst;
@@ -831,6 +832,7 @@ const Notifications = {
   }
 };
 
+
 // Backup/Export Functions
 async function exportFullBackup() {
   const segments = await DB.loadSegmentsFromDB();
@@ -1100,11 +1102,12 @@ async function init() {
       Vault.updateVaultUI();
 
       try {
-        await Proofs.generateAutoProof();        // cache to PROOFS_STORE for dashboard
-      } catch (e) {
-        console.warn('Auto-proof generation skipped:', e?.message || e);
-        UI.showAlert('Unlocked. Note: biometric proof cache was not created (you can still connect wallet and use P2P).');
-      }
+      await Proofs.generateAutoProof(); // cache to PROOFS_STORE for dashboard
+    } catch (e) {
+      console.warn('Auto-proof generation skipped:', e?.message || e);
+      UI.showAlert('Unlocked. Note: biometric proof cache was not created (you can still connect wallet and use P2P).');
+    }
+
       try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'true'); } catch {}
     } catch {
       await handleFailedAuthAttempt();
