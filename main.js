@@ -1,13 +1,5 @@
 /******************************
  * main.js - Production-Ready as of August 18, 2025
- * Baseline: Smart Contract (Finalized, No Changes)
- * Consistency: SHE/ECF Framework, Fixed 12 SHE/TVM Peg with Dynamic Pricing, Offline P2P (MSL), Centralized SCL for Institutions
- * Superiority: Instant Offline Transfers, Zero Fees, Full Traceability, Human-Centric (51% HI Rule)
- * Updated: Integrated functional DB functions, vault creation, and loading; Blockchain buttons auto-populate from BalanceChain proofs (no manual forms); MSL section no SCL mention; SCL generalized for any currency; Whitepaper updated for dynamic pricing/fixed SHE.
- * Best Practices: Error handling, gas optimization, secure biometrics, idle timeouts, sanitization, mobile-responsive, PWA standards, accessibility (aria labels), no uncaught errors.
- * Buttons disabled until wallet connected; Transfer TVM replaced with Swap USDT to TVM; No refill layers.
- * Fixed: Enter vault passphrase prompt, connect wallet functionality (MetaMask/WalletConnect).
- * Added: P2P segments transfer (Catch In/Out) with micro-ledger per segment (10 history events), ZKP for biometric human validation, validation on receive, update balance/transaction history.
  ******************************/
 
 // ---------- Base Setup / Global Constants ----------
@@ -300,7 +292,6 @@ const DB = {
 };
 
 // ---------- Biometric ----------
-// Biometric Module (WebAuthn with mobile-friendly tweaks + concurrency guard)
 const Biometric = {
   _bioBusy: false,
 
@@ -311,7 +302,7 @@ const Biometric = {
       const credential = await navigator.credentials.create({
         publicKey: {
           challenge: Utils.rand(32),
-          rp: { name: "BioVault", id: location.hostname }, // bind to your domain
+          rp: { name: "BioVault", id: location.hostname },
           user: { id: Utils.rand(16), name: "user@biovault", displayName: "User" },
           pubKeyCredParams: [
             { type: "public-key", alg: -7   }, // ES256
@@ -338,7 +329,7 @@ const Biometric = {
       const assertion = await navigator.credentials.get({
         publicKey: {
           challenge: Utils.rand(32),
-          allowCredentials: [{ type: "public-key", id: new Uint8Array(idBuf) }], // Uint8Array is key for iOS/Android
+          allowCredentials: [{ type: "public-key", id: new Uint8Array(idBuf) }],
           userVerification: "required",
           timeout: 60_000
         }
@@ -379,38 +370,45 @@ const Biometric = {
   }
 };
 
-// ---------- Vault helpers for UI show/hide ----------
-function revealVaultUI() {
-  // Hide whitepaper, hide locked panel, show vault panel
-  document.querySelector('#biovault .whitepaper')?.classList.add('hidden');
-  document.getElementById('lockedScreen')?.classList.add('hidden');
-  document.getElementById('vaultUI')?.classList.remove('hidden');
-  try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'true'); } catch {}
+// Optional: re-enroll fallback if device key changed
+async function reEnrollBiometricIfNeeded() {
+  try {
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        challenge: Utils.rand(32),
+        rp: { name: "BioVault", id: location.hostname },
+        user: { id: Utils.rand(16), name: "user@biovault", displayName: "User" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+        authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+        timeout: 60_000
+      }
+    });
+    if (!cred) return false;
+    vaultData.credentialId = Encryption.bufferToBase64(cred.rawId);
+    await persistVaultData(); // save with current derivedKey
+    return true;
+  } catch (e) {
+    console.warn('[BioVault] Re-enroll failed:', e);
+    return false;
+  }
 }
 
-function restoreLockedUI() {
-  document.querySelector('#biovault .whitepaper')?.classList.remove('hidden');
-  document.getElementById('vaultUI')?.classList.add('hidden');
-  document.getElementById('lockedScreen')?.classList.remove('hidden');
-  try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'false'); } catch {}
-}
-// Helpers to toggle vault vs whitepaper, and FORCE display override
+// ---------- Vault helpers for UI show/hide ----------
 function revealVaultUI() {
   document.querySelector('#biovault .whitepaper')?.classList.add('hidden');
   const locked = document.getElementById('lockedScreen');
   const vault  = document.getElementById('vaultUI');
   locked?.classList.add('hidden');
   if (vault) { vault.classList.remove('hidden'); vault.style.display = 'block'; } // override any CSS display:none
-  try { localStorage.setItem('vaultUnlocked', 'true'); } catch {}
+  try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'true'); } catch {}
 }
-
 function restoreLockedUI() {
   document.querySelector('#biovault .whitepaper')?.classList.remove('hidden');
   const locked = document.getElementById('lockedScreen');
   const vault  = document.getElementById('vaultUI');
   if (vault) { vault.classList.add('hidden'); vault.style.display = 'none'; }
   locked?.classList.remove('hidden');
-  try { localStorage.setItem('vaultUnlocked', 'false'); } catch {}
+  try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'false'); } catch {}
 }
 
 // ---------- Vault ----------
@@ -471,6 +469,7 @@ const Wallet = {
     const btn = document.getElementById('connect-wallet');
     if (btn) { btn.textContent = 'Wallet Connected'; btn.disabled = true; }
   },
+
   connectWalletConnect: async () => {
     let WCProvider;
     try {
@@ -494,17 +493,15 @@ const Wallet = {
     if (btn) { btn.textContent = 'Wallet Connected'; btn.disabled = true; }
   },
 
-initContracts: () => {
-  tvmContract = new ethers.Contract(CONTRACT_ADDRESS.toLowerCase(), ABI, signer);
-  usdtContract = new ethers.Contract(USDT_ADDRESS.toLowerCase(), [
-    {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-    {"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"spender","type":"address"}],
-     "name":"allowance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-    {"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],
-     "name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}
-    ], signer);
-  },
-  console.log('[BioVault] Contracts initialized');
+  initContracts: () => {
+    try {
+      tvmContract  = new ethers.Contract(CONTRACT_ADDRESS.toLowerCase(), ABI, signer);
+      usdtContract = new ethers.Contract(USDT_ADDRESS.toLowerCase(), [
+        {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+        {"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"spender","type":"address"}],"name":"allowance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+        {"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}
+      ], signer);
+      console.log('[BioVault] Contracts initialized');
     } catch (e) {
       console.error('[BioVault] initContracts failed', e);
     }
@@ -547,7 +544,7 @@ initContracts: () => {
 };
 
 // ---------- Proofs ----------
-// Proofs Module (No auto-ZKP during unlock; actions generate on demand)
+// No auto-ZKP during unlock; actions generate on demand
 const Proofs = {
   async generateAutoProof() {
     if (!vaultUnlocked) throw new Error('Vault locked.');
@@ -586,8 +583,7 @@ const Proofs = {
       autoNonce = stored.nonce;
       autoSignature = stored.signature;
     } else {
-      // Do NOT generate here to avoid surprise biometric prompts.
-      autoProofs = null;
+      autoProofs = null; // generate lazily on button click
     }
   },
 
@@ -598,7 +594,7 @@ const Proofs = {
       [p.segmentIndex, p.currentBioConst, p.ownershipProof, p.unlockIntegrityProof, p.spentProof, p.ownershipChangeCount, p.biometricZKP]
     )));
     const proofsHash = ethers.keccak256(coder.encode(['bytes32[]'], [inner]));
-    const domain = { name: 'TVM', version: '1', chainId: Number(chainId), verifyingContract: CONTRACT_ADDRESS };
+    const domain = { name: 'TVM', version: '1', chainId: Number(chainId), verifyingContract: CONTRACT_ADDRESS.toLowerCase() };
     const types = { Claim: [
       { name: 'user', type: 'address' },
       { name: 'proofsHash', type: 'bytes32' },
@@ -610,7 +606,6 @@ const Proofs = {
     return signer.signTypedData(domain, types, value);
   }
 };
-
 
 // ---------- UI ----------
 const UI = {
@@ -625,26 +620,18 @@ const UI = {
 
 // ---------- Contract Interactions ----------
 const withBuffer = (g) => (g * 120n) / 100n;
-const requireWallet = () => {
-  if (!tvmContract || !account) { UI.showAlert('Connect wallet first.'); return false; }
-  return true;
-};
-
-// Contract Interactions (guards + on-demand proof)
-const withBuffer = (g) => (g * 120n) / 100n;
 const ensureReady = () => {
   if (!account || !tvmContract) { UI.showAlert('Connect your wallet first.'); return false; }
   return true;
 };
+
 const ContractInteractions = {
   claimTVM: async () => {
     if (!ensureReady()) return;
     UI.showLoading('claim');
     try {
       await Proofs.loadAutoProof();
-      if (!autoProofs) {           // generate only when user clicks
-        await Proofs.generateAutoProof();
-      }
+      if (!autoProofs) await Proofs.generateAutoProof(); // prompt only now
       const gasEstimate = await tvmContract.estimateGas.claimTVM(
         autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce
       );
@@ -655,8 +642,7 @@ const ContractInteractions = {
       await tx.wait();
       UI.showAlert('Claim successful.');
       Wallet.updateBalances();
-      // prepare fresh proofs lazily next time user clicks
-      autoProofs = null;
+      autoProofs = null; // regenerate on next click
     } catch (err) {
       console.error(err);
       UI.showAlert('Error claiming TVM: ' + (err.reason || err.message || err));
@@ -691,7 +677,6 @@ const ContractInteractions = {
       const { tvm } = await Wallet.getOnchainBalances();
       const amount = tvm;
       if (amount === 0n) { UI.showAlert('No TVM to swap.'); return; }
-      // If TVM is ERC20 you’d approve here; if native, skip.
       const gasEstimate = await tvmContract.estimateGas.swapTVMForUSDT(amount);
       const tx = await tvmContract.swapTVMForUSDT(amount, { gasLimit: withBuffer(gasEstimate) });
       await tx.wait();
@@ -711,7 +696,7 @@ const ContractInteractions = {
       const { usdt: usdtBal } = await Wallet.getOnchainBalances();
       const amount = usdtBal;
       if (amount === 0n) { UI.showAlert('No USDT to swap.'); return; }
-      await Wallet.ensureAllowance(usdtContract, account, CONTRACT_ADDRESS, amount);
+      await Wallet.ensureAllowance(usdtContract, account, CONTRACT_ADDRESS.toLowerCase(), amount);
       const gasEstimate = await tvmContract.estimateGas.swapUSDTForTVM(amount);
       const tx = await tvmContract.swapUSDTForTVM(amount, { gasLimit: withBuffer(gasEstimate) });
       await tx.wait();
@@ -798,7 +783,7 @@ const P2P = {
       alert('Catch Out: Transfer payload generated. Share via NFC or QR.');
       vaultData.transactions.push({ bioIBAN: vaultData.bioIBAN, bioCatch: 'Outgoing to ' + recipientIBAN, amount: amount / EXCHANGE_RATE, timestamp: Date.now(), status: 'Sent' });
       await Vault.updateBalanceFromSegments();
-      await persistVaultData(); // Save-on-success
+      await persistVaultData();
     } finally {
       transactionLock = false;
     }
@@ -827,11 +812,12 @@ const P2P = {
         if (!(await Segment.validateSegment(seg))) continue;
         const last = seg.history[seg.history.length - 1];
         const timestamp = Date.now();
+        theBio = vaultData.bioIBAN; // for readability
         const bioConst = last.bioConst + BIO_STEP;
-        const integrityHash = await Utils.sha256Hex(last.integrityHash + 'Received' + timestamp + last.from + vaultData.bioIBAN + bioConst);
+        const integrityHash = await Utils.sha256Hex(last.integrityHash + 'Received' + timestamp + last.from + theBio + bioConst);
         const zkpIn = await Biometric.generateBiometricZKP();
-        seg.history.push({ event:'Received', timestamp, from:last.from, to:vaultData.bioIBAN, bioConst, integrityHash, biometricZKP: zkpIn });
-        seg.currentOwner = vaultData.bioIBAN;
+        seg.history.push({ event:'Received', timestamp, from:last.from, to:theBio, bioConst, integrityHash, biometricZKP: zkpIn });
+        seg.currentOwner = theBio;
         await DB.saveSegmentToDB(seg);
         validSegments++;
       }
@@ -880,7 +866,6 @@ async function exportFullBackup() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a'); a.href = url; a.download = 'biovault.fullbackup.json'; a.click();
 }
-
 async function importFullBackup(file) {
   const txt = await file.text();
   const obj = JSON.parse(txt);
@@ -907,7 +892,6 @@ async function importFullBackup(file) {
   Vault.updateVaultUI();
   UI.showAlert('Full backup imported.');
 }
-
 function exportTransactions() {
   const blob = new Blob([JSON.stringify(vaultData.transactions)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -952,11 +936,9 @@ function copyToClipboard(id) {
 
 // ---------- Export to Blockchain helper ----------
 async function exportProofToBlockchain() {
-  showSection('dashboard'); // just navigate
-  // Do NOT call generate/load proof here to avoid an unexpected biometric prompt
+  showSection('dashboard');
   UI.showAlert('Open the Dashboard and click an action (e.g., Claim) to authorize with biometrics.');
 }
-
 
 // ---------- Section Switching ----------
 function showSection(id) {
@@ -964,7 +946,6 @@ function showSection(id) {
   document.getElementById(id).classList.add('active-section');
   if (id === 'dashboard') loadDashboardData();
   if (id === 'biovault' && vaultUnlocked) {
-    // ensure whitepaper stays hidden after returning to BioVault section
     document.querySelector('#biovault .whitepaper')?.classList.add('hidden');
     document.getElementById('vaultUI')?.classList.remove('hidden');
     document.getElementById('lockedScreen')?.classList.add('hidden');
@@ -1072,7 +1053,7 @@ async function init() {
 
       const salt = Utils.rand(16);
       const pin = prompt("Set passphrase:");
-      derivedKey = await Vault.deriveKeyFromPIN(Utils.sanitizeInput(pin), salt);
+      derivedKey = await Vault.deriveKeyFromPIN(Utils.sanitizeInput(pin || ''), salt);
       await persistVaultData(salt);
 
       for (let i=1;i<=INITIAL_BALANCE_SHE;i++){
@@ -1102,43 +1083,33 @@ async function init() {
   byId('connectMetaMaskBtn')?.addEventListener('click', Wallet.connectMetaMask);
   byId('connectWalletConnectBtn')?.addEventListener('click', Wallet.connectWalletConnect);
 
-byId('enterVaultBtn')?.addEventListener('click', async () => {
-  console.log('[BioVault] Enter Vault clicked');
-  if (isVaultLockedOut()) { UI.showAlert("Vault locked out."); return; }
+  byId('enterVaultBtn')?.addEventListener('click', async () => {
+    console.log('[BioVault] Enter Vault clicked');
+    if (isVaultLockedOut()) { UI.showAlert("Vault locked out."); return; }
 
-  const pin = prompt("Enter passphrase:");
-  const stored = await DB.loadVaultDataFromDB();
-  if (!stored) return;
+    const pin = prompt("Enter passphrase:");
+    const stored = await DB.loadVaultDataFromDB();
+    if (!stored) return;
 
-  derivedKey = await Vault.deriveKeyFromPIN(Utils.sanitizeInput(pin || ''), stored.salt);
-  try {
-    vaultData = await Encryption.decryptData(derivedKey, stored.iv, stored.ciphertext);
+    derivedKey = await Vault.deriveKeyFromPIN(Utils.sanitizeInput(pin || ''), stored.salt);
+    try {
+      vaultData = await Encryption.decryptData(derivedKey, stored.iv, stored.ciphertext);
 
-    const ok = await Biometric.performBiometricAssertion(vaultData.credentialId);
-    if (!ok) { await handleFailedAuthAttempt(); return UI.showAlert("Biometric failed."); }
+      // Try platform assertion; offer re-enroll if it fails (mobile-friendly)
+      let ok = await Biometric.performBiometricAssertion(vaultData.credentialId);
+      if (!ok) {
+        const wantReEnroll = confirm("Biometric failed. Re-enroll on this device and proceed?");
+        if (wantReEnroll) ok = await reEnrollBiometricIfNeeded();
+      }
+      if (!ok) { await handleFailedAuthAttempt(); return UI.showAlert("Biometric failed."); }
 
-    // Success
-    vaultUnlocked = true;
-    revealVaultUI();                 // <— force show vault panel + hide whitepaper
-    await Vault.updateBalanceFromSegments();
-    Vault.updateVaultUI();
-
-    // Do NOT generate ZKP here; actions will prompt when needed
-    try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'true'); } catch {}
-  } catch (e) {
-    console.error('[BioVault] Unlock error', e);
-    await handleFailedAuthAttempt();
-    UI.showAlert("Invalid passphrase or corrupted vault.");
-  }
-});
-
-
-      // Now update the UI data in the background
-      try { await Vault.updateBalanceFromSegments(); } catch (e) { console.warn('[BioVault] updateBalanceFromSegments', e); }
-      try { Vault.updateVaultUI(); } catch (e) { console.warn('[BioVault] updateVaultUI', e); }
-      try { await Proofs.generateAutoProof(); } catch (e) { console.warn('Auto-proof generation skipped:', e?.message || e); }
-
-    } catch {
+      vaultUnlocked = true;
+      revealVaultUI();
+      await Vault.updateBalanceFromSegments();
+      Vault.updateVaultUI();
+      try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'true'); } catch {}
+    } catch (e) {
+      console.error('[BioVault] Unlock error', e);
       await handleFailedAuthAttempt();
       UI.showAlert("Invalid passphrase or corrupted vault.");
     }
@@ -1165,14 +1136,14 @@ byId('enterVaultBtn')?.addEventListener('click', async () => {
     if (el) el.textContent = new Date().toUTCString();
   }, 1000);
 
-  // Load Dashboard on Init if Needed (will no-op if wallet not connected)
+  // Load Dashboard on Init if Needed (no-op if wallet not connected)
   loadDashboardData();
   console.log('[BioVault] init() complete.');
 }
 
 // ---------- Dashboard ----------
 async function loadDashboardData() {
-  if (!tvmContract) return; // safe no-op until wallet is connected
+  if (!tvmContract) return;
   await Wallet.updateBalances();
 
   let table = '';
