@@ -476,16 +476,16 @@ const Wallet = {
   connectWalletConnect: async () => {
     let WCProvider;
     try {
-    WCProvider = await import('https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.14.0/dist/esm/index.js');
+      WCProvider = await import('https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.14.0/dist/esm/index.js');
     } catch (e) {
-    UI.showAlert('Could not load WalletConnect (offline or blocked). Try MetaMask.');
-    return;
+      UI.showAlert('Could not load WalletConnect (offline or blocked). Try MetaMask.');
+      return;
     }
 
     const wcProvider = await WCProvider.EthereumProvider.init({
-    projectId: WALLET_CONNECT_PROJECT_ID,
-    chains: [1], // Mainnet
-    showQrModal: true
+      projectId: WALLET_CONNECT_PROJECT_ID,
+      chains: [1], // Mainnet
+      showQrModal: true
     });
 
     await wcProvider.enable();
@@ -502,8 +502,8 @@ const Wallet = {
 
     const btn = document.getElementById('connect-wallet');
     if (btn) {
-    btn.textContent = 'Wallet Connected';
-    btn.disabled = true;
+      btn.textContent = 'Wallet Connected';
+      btn.disabled = true;
     }
   },
 
@@ -520,33 +520,33 @@ const Wallet = {
   updateBalances: async () => {
     if (!tvmContract || !account) return;
     try {
-    const tvmBal = await tvmContract.balanceOf(account);
-    document.getElementById('user-balance').textContent = ethers.formatUnits(tvmBal, 18) + ' TVM';
+      const tvmBal = await tvmContract.balanceOf(account);
+      document.getElementById('user-balance').textContent = ethers.formatUnits(tvmBal, 18) + ' TVM';
 
-    const usdtBal = await usdtContract.balanceOf(account);
-    document.getElementById('usdt-balance').textContent = ethers.formatUnits(usdtBal, 6) + ' USDT';
+      const usdtBal = await usdtContract.balanceOf(account);
+      document.getElementById('usdt-balance').textContent = ethers.formatUnits(usdtBal, 6) + ' USDT';
 
-    // Static placeholders / dashboard-owned metrics
-    document.getElementById('tvm-price').textContent = '1.00 USDT';
-    document.getElementById('pool-ratio').textContent = '51% HI / 49% AI';
-    document.getElementById('avg-reserves').textContent = '100M TVM';
+      // Static placeholders / dashboard-owned metrics
+      document.getElementById('tvm-price').textContent = '1.00 USDT';
+      document.getElementById('pool-ratio').textContent = '51% HI / 49% AI';
+      document.getElementById('avg-reserves').textContent = '100M TVM';
     } catch (e) {
-    console.warn('Balance refresh failed:', e);
-    const ub = document.getElementById('user-balance');
-    const uu = document.getElementById('usdt-balance');
-    if (ub) ub.textContent = '— TVM';
-    if (uu) uu.textContent = '— USDT';
+      console.warn('Balance refresh failed:', e);
+      const ub = document.getElementById('user-balance');
+      const uu = document.getElementById('usdt-balance');
+      if (ub) ub.textContent = '— TVM';
+      if (uu) uu.textContent = '— USDT';
     }
   },
 
   ensureAllowance: async (token, owner, spender, amount) => {
-      if (!token.allowance) return; // non-ERC20, bail
-      const a = await token.allowance(owner, spender);
-      if (a < amount) {
-        const tx = await token.approve(spender, amount);
-        await tx.wait();
-      }
-    },
+    if (!token.allowance) return; // non-ERC20, bail
+    const a = await token.allowance(owner, spender);
+    if (a < amount) {
+      const tx = await token.approve(spender, amount);
+      await tx.wait();
+    }
+  },
 
   getOnchainBalances: async () => {
     const tvm = await tvmContract.balanceOf(account);   // bigint
@@ -622,11 +622,20 @@ const ContractInteractions = {
     await Proofs.loadAutoProof();
     UI.showLoading('claim');
     try {
-      const gasEstimate = await tvmContract.estimateGas.claimTVM(autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce);
-      const tx = await tvmContract.claimTVM(autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce, { gasLimit: withBuffer(gasEstimate) });
+      const gasEstimate = await tvmContract.estimateGas.claimTVM(
+        autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce
+      );
+      const tx = await tvmContract.claimTVM(
+        autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce,
+        { gasLimit: withBuffer(gasEstimate) }
+      );
       await tx.wait();
       UI.showAlert('Claim successful.');
       Wallet.updateBalances();
+
+      // Prepare fresh proofs for the next claim
+      try { await Proofs.generateAutoProof(); }
+      catch (e) { console.warn('Proof refresh skipped:', e?.message || e); }
     } catch (err) {
       console.error(err);
       UI.showAlert('Error claiming TVM: ' + (err.reason || err.message || err));
@@ -744,8 +753,12 @@ const P2P = {
       if (!vaultUnlocked) return UI.showAlert('Vault locked.');
       const amount = parseInt(prompt('Amount in SHE to send:'));
       if (isNaN(amount) || amount <= 0 || amount > vaultData.balanceSHE) return UI.showAlert('Invalid amount.');
-      const recipientIBAN = prompt('Recipient Bio-IBAN:');
+      if (amount > 300) return UI.showAlert('Amount exceeds per-transfer segment limit.');
+
+      const _raw = prompt('Recipient Bio-IBAN:');
+      const recipientIBAN = _raw ? Utils.sanitizeInput(_raw) : '';
       if (!recipientIBAN) return;
+
       const segments = await DB.loadSegmentsFromDB();
       const transferableSegments = segments.filter(s => s.currentOwner === vaultData.bioIBAN).slice(0, amount);
       if (transferableSegments.length < amount) return UI.showAlert('Insufficient segments.');
@@ -791,10 +804,14 @@ const P2P = {
       if (!vaultUnlocked) return UI.showAlert('Vault locked.');
       const payloadStr = prompt('Enter Bio-Catch payload (JSON):'); // Simulate receive; in prod, from NFC/QR
       if (!payloadStr) return;
+      if (payloadStr.length > 750000) return UI.showAlert('Payload too large.');
+
       let payload;
       try { payload = JSON.parse(payloadStr); } catch { return UI.showAlert('Invalid payload JSON.'); }
       if (!payload || !Array.isArray(payload.bioCatch)) return UI.showAlert('Malformed payload: missing bioCatch array.');
       if (!payload.nonce) return UI.showAlert('Malformed payload: missing nonce.');
+      if (payload.bioCatch.length > 300) return UI.showAlert('Too many segments in a single payload.');
+
       if (await DB.hasReplayNonce(payload.nonce)) return UI.showAlert('Duplicate transfer detected (replay).');
       await DB.putReplayNonce(payload.nonce);
       let validSegments = 0;
@@ -1129,11 +1146,11 @@ async function init() {
       Vault.updateVaultUI();
 
       try {
-      await Proofs.generateAutoProof(); // cache to PROOFS_STORE for dashboard
-    } catch (e) {
-      console.warn('Auto-proof generation skipped:', e?.message || e);
-      UI.showAlert('Unlocked. Note: biometric proof cache was not created (you can still connect wallet and use P2P).');
-    }
+        await Proofs.generateAutoProof(); // cache to PROOFS_STORE for dashboard
+      } catch (e) {
+        console.warn('Auto-proof generation skipped:', e?.message || e);
+        UI.showAlert('Unlocked. Note: biometric proof cache was not created (you can still connect wallet and use P2P).');
+      }
 
       try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'true'); } catch {}
     } catch {
@@ -1166,31 +1183,43 @@ async function init() {
 // Load Dashboard Data (Real Contract Calls + Charts)
 async function loadDashboardData() {
   if (!tvmContract) return;
+
   // Update Balances
   await Wallet.updateBalances();
-  // Layer Table (Mock/Real - Assume contract has getLayerReserve(layer))
+
+  // Layer Table (mocked; replace with real calls if available)
   let table = '';
   let totalReserves = 0;
   for (let i = 1; i <= LAYERS; i++) {
-    const reserve = 100000000; // Mock, replace with await tvmContract.getLayerReserve(i) if function added
+    const reserve = 100000000; // Mock, replace with await tvmContract.getLayerReserve(i)
     totalReserves += reserve;
-    const capProgress = (SEGMENTS_PER_LAYER / reserve * 100).toFixed(2) + '%'; // Example
+    const capProgress = (SEGMENTS_PER_LAYER / reserve * 100).toFixed(2) + '%';
     table += `<tr><td>${i}</td><td>${reserve.toLocaleString()} TVM</td><td>${capProgress}</td></tr>`;
   }
   document.getElementById('layer-table').innerHTML = table;
   document.getElementById('avg-reserves').textContent = (totalReserves / LAYERS).toLocaleString() + ' TVM';
-  // Charts (Updated with Chart.js v4)
+
+  // Charts (Chart.js v4) — prevent duplicate instances
   const c1 = document.getElementById('pool-chart');
   const c2 = document.getElementById('layer-chart');
   if (window.Chart && c1 && c2) {
-    new Chart(c1, {
+    if (c1._chart) c1._chart.destroy();
+    c1._chart = new Chart(c1, {
       type: 'doughnut',
-      data: { labels: ['Human Investment (51%)', 'AI Cap (49%)'], datasets: [{ data: [51, 49], backgroundColor: ['#007bff', '#dc3545'], borderRadius: 5 }] },
+      data: {
+        labels: ['Human Investment (51%)', 'AI Cap (49%)'],
+        datasets: [{ data: [51, 49], backgroundColor: ['#007bff', '#dc3545'], borderRadius: 5 }]
+      },
       options: { responsive: true, plugins: { legend: { position: 'bottom' } }, cutout: '60%' }
     });
-    new Chart(c2, {
+
+    if (c2._chart) c2._chart.destroy();
+    c2._chart = new Chart(c2, {
       type: 'bar',
-      data: { labels: Array.from({length: LAYERS}, (_, i) => `Layer ${i+1}`), datasets: [{ label: 'Reserve (M TVM)', data: Array(LAYERS).fill(100), backgroundColor: '#007bff' }] },
+      data: {
+        labels: Array.from({ length: LAYERS }, (_, i) => `Layer ${i + 1}`),
+        datasets: [{ label: 'Reserve (M TVM)', data: Array(LAYERS).fill(100), backgroundColor: '#007bff' }]
+      },
       options: { responsive: true, scales: { y: { beginAtZero: true } } }
     });
   }
