@@ -474,25 +474,39 @@ const Wallet = {
     }
   },
   connectWalletConnect: async () => {
-    const WCProvider = await import('https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.14.0/dist/esm/index.js'); // Dynamic import for 2025
+    let WCProvider;
+    try {
+    WCProvider = await import('https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.14.0/dist/esm/index.js');
+    } catch (e) {
+    UI.showAlert('Could not load WalletConnect (offline or blocked). Try MetaMask.');
+    return;
+    }
+
     const wcProvider = await WCProvider.EthereumProvider.init({
-      projectId: WALLET_CONNECT_PROJECT_ID,
-      chains: [1], // Mainnet
-      showQrModal: true
+    projectId: WALLET_CONNECT_PROJECT_ID,
+    chains: [1], // Mainnet
+    showQrModal: true
     });
+
     await wcProvider.enable();
     provider = new ethers.BrowserProvider(wcProvider);
     signer = await provider.getSigner();
     account = await signer.getAddress();
     chainId = await provider.getNetwork().then(net => net.chainId);
+
     vaultData.userWallet = account;
     UI.updateConnectedAccount();
     Wallet.initContracts();
     Wallet.updateBalances();
     enableDashboardButtons();
-    document.getElementById('connect-wallet').textContent = 'Wallet Connected';
-    document.getElementById('connect-wallet').disabled = true;
+
+    const btn = document.getElementById('connect-wallet');
+    if (btn) {
+    btn.textContent = 'Wallet Connected';
+    btn.disabled = true;
+    }
   },
+
   initContracts: () => {
     tvmContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
     usdtContract = new ethers.Contract(USDT_ADDRESS, [
@@ -504,23 +518,36 @@ const Wallet = {
     ], signer);
   },
   updateBalances: async () => {
-    if (tvmContract && account) {
-      const tvmBal = await tvmContract.balanceOf(account);
-      document.getElementById('user-balance').textContent = ethers.formatUnits(tvmBal, 18) + ' TVM';
-      const usdtBal = await usdtContract.balanceOf(account);
-      document.getElementById('usdt-balance').textContent = ethers.formatUnits(usdtBal, 6) + ' USDT';
-      // Update other metrics
-      document.getElementById('tvm-price').textContent = '1.00 USDT'; // Dynamic, but example
-      document.getElementById('pool-ratio').textContent = '51% HI / 49% AI';
-      // Avg reserves mock or call if function exists
-      document.getElementById('avg-reserves').textContent = '100M TVM';
+    if (!tvmContract || !account) return;
+    try {
+    const tvmBal = await tvmContract.balanceOf(account);
+    document.getElementById('user-balance').textContent = ethers.formatUnits(tvmBal, 18) + ' TVM';
+
+    const usdtBal = await usdtContract.balanceOf(account);
+    document.getElementById('usdt-balance').textContent = ethers.formatUnits(usdtBal, 6) + ' USDT';
+
+    // Static placeholders / dashboard-owned metrics
+    document.getElementById('tvm-price').textContent = '1.00 USDT';
+    document.getElementById('pool-ratio').textContent = '51% HI / 49% AI';
+    document.getElementById('avg-reserves').textContent = '100M TVM';
+    } catch (e) {
+    console.warn('Balance refresh failed:', e);
+    const ub = document.getElementById('user-balance');
+    const uu = document.getElementById('usdt-balance');
+    if (ub) ub.textContent = '— TVM';
+    if (uu) uu.textContent = '— USDT';
     }
   },
+
   ensureAllowance: async (token, owner, spender, amount) => {
-    if (!token.allowance) return; // non-ERC20, bail
-    const a = await token.allowance(owner, spender);
-    if (a < amount) await token.approve(spender, amount);
-  },
+      if (!token.allowance) return; // non-ERC20, bail
+      const a = await token.allowance(owner, spender);
+      if (a < amount) {
+        const tx = await token.approve(spender, amount);
+        await tx.wait();
+      }
+    },
+
   getOnchainBalances: async () => {
     const tvm = await tvmContract.balanceOf(account);   // bigint
     const usdt = await usdtContract.balanceOf(account); // bigint
