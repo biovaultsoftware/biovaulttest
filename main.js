@@ -24,7 +24,7 @@ const MAX_AUTH_ATTEMPTS = 3;
 
 // IMPORTANT: lowercase to bypass strict checksum validation in ethers v6
 const CONTRACT_ADDRESS = '0xcc79b1bc9eabc3d30a3800f4d41a4a0599e1f3c6';
-const USDT_ADDRESS      = '0xdac17f958d2ee523a2206206994597c13d831ec7';
+const USDT_ADDRESS     = '0xdac17f958d2ee523a2206206994597c13d831ec7';
 
 const ABI = [
   { "inputs":[{ "components":[
@@ -300,51 +300,82 @@ const DB = {
 };
 
 // ---------- Biometric ----------
+// Biometric Module (WebAuthn with mobile-friendly tweaks + concurrency guard)
 const Biometric = {
+  _bioBusy: false,
+
   performBiometricAuthenticationForCreation: async () => {
+    if (Biometric._bioBusy) return null;
+    Biometric._bioBusy = true;
     try {
       const credential = await navigator.credentials.create({
         publicKey: {
           challenge: Utils.rand(32),
-          rp: { name: "BioVault" },
+          rp: { name: "BioVault", id: location.hostname }, // bind to your domain
           user: { id: Utils.rand(16), name: "user@biovault", displayName: "User" },
-          pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
-          authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" }
+          pubKeyCredParams: [
+            { type: "public-key", alg: -7   }, // ES256
+            { type: "public-key", alg: -257 }  // RS256
+          ],
+          authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+          timeout: 60_000
         }
       });
       return credential;
     } catch (err) {
       console.error('[BioVault] Biometric creation failed', err);
       return null;
+    } finally {
+      Biometric._bioBusy = false;
     }
   },
+
   performBiometricAssertion: async (credentialId) => {
+    if (Biometric._bioBusy) return false;
+    Biometric._bioBusy = true;
     try {
+      const idBuf = Encryption.base64ToBuffer(credentialId);
       const assertion = await navigator.credentials.get({
         publicKey: {
           challenge: Utils.rand(32),
-          allowCredentials: [{ type: "public-key", id: Encryption.base64ToBuffer(credentialId) }],
-          userVerification: "required"
+          allowCredentials: [{ type: "public-key", id: new Uint8Array(idBuf) }], // Uint8Array is key for iOS/Android
+          userVerification: "required",
+          timeout: 60_000
         }
       });
       return !!assertion;
     } catch (err) {
       console.error('[BioVault] Biometric assertion failed', err);
       return false;
+    } finally {
+      Biometric._bioBusy = false;
     }
   },
+
   generateBiometricZKP: async () => {
-    const challenge = Utils.rand(32);
-    const assertion = await navigator.credentials.get({
-      publicKey: {
-        challenge,
-        allowCredentials: [{ type: "public-key", id: Encryption.base64ToBuffer(vaultData.credentialId) }],
-        userVerification: "required"
-      }
-    });
-    if (!assertion) return null;
-    const hex = await Utils.sha256Hex(String.fromCharCode(...new Uint8Array(assertion.signature)));
-    return Utils.to0x(hex);
+    if (!vaultData?.credentialId) return null;
+    if (Biometric._bioBusy) return null;
+    Biometric._bioBusy = true;
+    try {
+      const challenge = Utils.rand(32);
+      const idBuf = Encryption.base64ToBuffer(vaultData.credentialId);
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge,
+          allowCredentials: [{ type: "public-key", id: new Uint8Array(idBuf) }],
+          userVerification: "required",
+          timeout: 60_000
+        }
+      });
+      if (!assertion) return null;
+      const hex = await Utils.sha256Hex(String.fromCharCode(...new Uint8Array(assertion.signature)));
+      return Utils.to0x(hex);
+    } catch (err) {
+      console.error('[BioVault] Biometric ZKP failed', err);
+      return null;
+    } finally {
+      Biometric._bioBusy = false;
+    }
   }
 };
 
@@ -362,6 +393,24 @@ function restoreLockedUI() {
   document.getElementById('vaultUI')?.classList.add('hidden');
   document.getElementById('lockedScreen')?.classList.remove('hidden');
   try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'false'); } catch {}
+}
+// Helpers to toggle vault vs whitepaper, and FORCE display override
+function revealVaultUI() {
+  document.querySelector('#biovault .whitepaper')?.classList.add('hidden');
+  const locked = document.getElementById('lockedScreen');
+  const vault  = document.getElementById('vaultUI');
+  locked?.classList.add('hidden');
+  if (vault) { vault.classList.remove('hidden'); vault.style.display = 'block'; } // override any CSS display:none
+  try { localStorage.setItem('vaultUnlocked', 'true'); } catch {}
+}
+
+function restoreLockedUI() {
+  document.querySelector('#biovault .whitepaper')?.classList.remove('hidden');
+  const locked = document.getElementById('lockedScreen');
+  const vault  = document.getElementById('vaultUI');
+  if (vault) { vault.classList.add('hidden'); vault.style.display = 'none'; }
+  locked?.classList.remove('hidden');
+  try { localStorage.setItem('vaultUnlocked', 'false'); } catch {}
 }
 
 // ---------- Vault ----------
@@ -445,17 +494,17 @@ const Wallet = {
     if (btn) { btn.textContent = 'Wallet Connected'; btn.disabled = true; }
   },
 
-  initContracts: () => {
-    try {
-      const tvmAddr  = CONTRACT_ADDRESS.toLowerCase();
-      const usdtAddr = USDT_ADDRESS.toLowerCase();
-      tvmContract = new ethers.Contract(tvmAddr, ABI, signer);
-      usdtContract = new ethers.Contract(usdtAddr, [
-        {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-        {"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"spender","type":"address"}],"name":"allowance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-        {"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}
-      ], signer);
-      console.log('[BioVault] Contracts initialized');
+initContracts: () => {
+  tvmContract = new ethers.Contract(CONTRACT_ADDRESS.toLowerCase(), ABI, signer);
+  usdtContract = new ethers.Contract(USDT_ADDRESS.toLowerCase(), [
+    {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"spender","type":"address"}],
+     "name":"allowance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],
+     "name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}
+    ], signer);
+  },
+  console.log('[BioVault] Contracts initialized');
     } catch (e) {
       console.error('[BioVault] initContracts failed', e);
     }
@@ -498,8 +547,9 @@ const Wallet = {
 };
 
 // ---------- Proofs ----------
+// Proofs Module (No auto-ZKP during unlock; actions generate on demand)
 const Proofs = {
-  generateAutoProof: async () => {
+  async generateAutoProof() {
     if (!vaultUnlocked) throw new Error('Vault locked.');
     const segmentIndex = Math.floor(Math.random() * 1200) + 1;
     const currentBioConst = vaultData.initialBioConstant + segmentIndex;
@@ -507,46 +557,60 @@ const Proofs = {
     const unlockIntegrityProof = Utils.to0x(await Utils.sha256Hex('integrity' + currentBioConst));
     const spentProof = Utils.to0x(await Utils.sha256Hex('spent' + segmentIndex));
     const ownershipChangeCount = 0;
+
     const biometricZKP = await Biometric.generateBiometricZKP();
     if (!biometricZKP) throw new Error('Biometric ZKP generation failed or was denied.');
 
     autoProofs = [{ segmentIndex, currentBioConst, ownershipProof, unlockIntegrityProof, spentProof, ownershipChangeCount, biometricZKP }];
     autoDeviceKeyHash = vaultData.deviceKeyHash;
     autoUserBioConstant = currentBioConst;
-    autoNonce = Math.floor(Math.random() * 1000000);
+    autoNonce = Math.floor(Math.random() * 1_000_000);
     autoSignature = await Proofs.signClaim(autoProofs, autoDeviceKeyHash, autoUserBioConstant, autoNonce);
-    await DB.saveProofsToDB({ proofs: autoProofs, deviceKeyHash: autoDeviceKeyHash, userBioConstant: autoUserBioConstant, nonce: autoNonce, signature: autoSignature });
+
+    await DB.saveProofsToDB({
+      proofs: autoProofs,
+      deviceKeyHash: autoDeviceKeyHash,
+      userBioConstant: autoUserBioConstant,
+      nonce: autoNonce,
+      signature: autoSignature
+    });
     return true;
   },
-  loadAutoProof: async () => {
-    const storedProofs = await DB.loadProofsFromDB();
-    if (storedProofs) {
-      autoProofs = storedProofs.proofs;
-      autoDeviceKeyHash = storedProofs.deviceKeyHash;
-      autoUserBioConstant = storedProofs.userBioConstant;
-      autoNonce = storedProofs.nonce;
-      autoSignature = storedProofs.signature;
+
+  async loadAutoProof() {
+    const stored = await DB.loadProofsFromDB();
+    if (stored) {
+      autoProofs = stored.proofs;
+      autoDeviceKeyHash = stored.deviceKeyHash;
+      autoUserBioConstant = stored.userBioConstant;
+      autoNonce = stored.nonce;
+      autoSignature = stored.signature;
     } else {
-      await Proofs.generateAutoProof();
+      // Do NOT generate here to avoid surprise biometric prompts.
+      autoProofs = null;
     }
   },
-  signClaim: async (proofs, deviceKeyHash, userBioConstant, nonce) => {
+
+  async signClaim(proofs, deviceKeyHash, userBioConstant, nonce) {
     const coder = ethers.AbiCoder.defaultAbiCoder();
     const inner = proofs.map(p => ethers.keccak256(coder.encode(
       ['uint256','uint256','bytes32','bytes32','bytes32','uint256','bytes32'],
       [p.segmentIndex, p.currentBioConst, p.ownershipProof, p.unlockIntegrityProof, p.spentProof, p.ownershipChangeCount, p.biometricZKP]
     )));
     const proofsHash = ethers.keccak256(coder.encode(['bytes32[]'], [inner]));
-    const domain = { name:'TVM', version:'1', chainId:Number(chainId), verifyingContract: CONTRACT_ADDRESS.toLowerCase() };
-    const types  = { Claim: [
-      { name:'user', type:'address' }, { name:'proofsHash', type:'bytes32' },
-      { name:'deviceKeyHash', type:'bytes32' }, { name:'userBioConstant', type:'uint256' }, { name:'nonce', type:'uint256' }
+    const domain = { name: 'TVM', version: '1', chainId: Number(chainId), verifyingContract: CONTRACT_ADDRESS };
+    const types = { Claim: [
+      { name: 'user', type: 'address' },
+      { name: 'proofsHash', type: 'bytes32' },
+      { name: 'deviceKeyHash', type: 'bytes32' },
+      { name: 'userBioConstant', type: 'uint256' },
+      { name: 'nonce', type: 'uint256' }
     ]};
     const value = { user: account, proofsHash, deviceKeyHash, userBioConstant, nonce };
-    const signature = await signer.signTypedData(domain, types, value);
-    return signature;
+    return signer.signTypedData(domain, types, value);
   }
 };
+
 
 // ---------- UI ----------
 const UI = {
@@ -566,18 +630,33 @@ const requireWallet = () => {
   return true;
 };
 
+// Contract Interactions (guards + on-demand proof)
+const withBuffer = (g) => (g * 120n) / 100n;
+const ensureReady = () => {
+  if (!account || !tvmContract) { UI.showAlert('Connect your wallet first.'); return false; }
+  return true;
+};
 const ContractInteractions = {
   claimTVM: async () => {
-    if (!requireWallet()) return;
-    await Proofs.loadAutoProof();
+    if (!ensureReady()) return;
     UI.showLoading('claim');
     try {
-      const gasEstimate = await tvmContract.estimateGas.claimTVM(autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce);
-      const tx = await tvmContract.claimTVM(autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce, { gasLimit: withBuffer(gasEstimate) });
+      await Proofs.loadAutoProof();
+      if (!autoProofs) {           // generate only when user clicks
+        await Proofs.generateAutoProof();
+      }
+      const gasEstimate = await tvmContract.estimateGas.claimTVM(
+        autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce
+      );
+      const tx = await tvmContract.claimTVM(
+        autoProofs, autoSignature, autoDeviceKeyHash, autoUserBioConstant, autoNonce,
+        { gasLimit: withBuffer(gasEstimate) }
+      );
       await tx.wait();
       UI.showAlert('Claim successful.');
       Wallet.updateBalances();
-      try { await Proofs.generateAutoProof(); } catch (e) { console.warn('Proof refresh skipped:', e?.message || e); }
+      // prepare fresh proofs lazily next time user clicks
+      autoProofs = null;
     } catch (err) {
       console.error(err);
       UI.showAlert('Error claiming TVM: ' + (err.reason || err.message || err));
@@ -587,11 +666,12 @@ const ContractInteractions = {
   },
 
   exchangeTVMForSegments: async () => {
-    if (!requireWallet()) return;
+    if (!ensureReady()) return;
     UI.showLoading('exchange');
     try {
       const { tvm } = await Wallet.getOnchainBalances();
       const amount = tvm;
+      if (amount === 0n) { UI.showAlert('No TVM to exchange.'); return; }
       const gasEstimate = await tvmContract.estimateGas.exchangeTVMForSegments(amount);
       const tx = await tvmContract.exchangeTVMForSegments(amount, { gasLimit: withBuffer(gasEstimate) });
       await tx.wait();
@@ -605,12 +685,13 @@ const ContractInteractions = {
   },
 
   swapTVMForUSDT: async () => {
-    if (!requireWallet()) return;
+    if (!ensureReady()) return;
     UI.showLoading('swap');
     try {
       const { tvm } = await Wallet.getOnchainBalances();
       const amount = tvm;
-      await Wallet.ensureAllowance(tvmContract, account, CONTRACT_ADDRESS.toLowerCase(), amount);
+      if (amount === 0n) { UI.showAlert('No TVM to swap.'); return; }
+      // If TVM is ERC20 you’d approve here; if native, skip.
       const gasEstimate = await tvmContract.estimateGas.swapTVMForUSDT(amount);
       const tx = await tvmContract.swapTVMForUSDT(amount, { gasLimit: withBuffer(gasEstimate) });
       await tx.wait();
@@ -624,16 +705,17 @@ const ContractInteractions = {
   },
 
   swapUSDTForTVM: async () => {
-    if (!requireWallet()) return;
+    if (!ensureReady()) return;
     UI.showLoading('swap-usdt');
     try {
       const { usdt: usdtBal } = await Wallet.getOnchainBalances();
       const amount = usdtBal;
-      await Wallet.ensureAllowance(usdtContract, account, CONTRACT_ADDRESS.toLowerCase(), amount);
+      if (amount === 0n) { UI.showAlert('No USDT to swap.'); return; }
+      await Wallet.ensureAllowance(usdtContract, account, CONTRACT_ADDRESS, amount);
       const gasEstimate = await tvmContract.estimateGas.swapUSDTForTVM(amount);
       const tx = await tvmContract.swapUSDTForTVM(amount, { gasLimit: withBuffer(gasEstimate) });
       await tx.wait();
-      UI.showAlert('Swap USDT to TVM successful.');
+      UI.showAlert('Swap USDT→TVM successful.');
       Wallet.updateBalances();
     } catch (err) {
       UI.showAlert('Error swapping USDT to TVM: ' + (err.reason || err.message));
@@ -870,10 +952,11 @@ function copyToClipboard(id) {
 
 // ---------- Export to Blockchain helper ----------
 async function exportProofToBlockchain() {
-  showSection('dashboard');
-  try { await Proofs.loadAutoProof(); } catch (e) { console.warn('[BioVault] loadAutoProof:', e); }
-  UI.showAlert('Proof auto-exported to dashboard actions.');
+  showSection('dashboard'); // just navigate
+  // Do NOT call generate/load proof here to avoid an unexpected biometric prompt
+  UI.showAlert('Open the Dashboard and click an action (e.g., Claim) to authorize with biometrics.');
 }
+
 
 // ---------- Section Switching ----------
 function showSection(id) {
@@ -1019,22 +1102,36 @@ async function init() {
   byId('connectMetaMaskBtn')?.addEventListener('click', Wallet.connectMetaMask);
   byId('connectWalletConnectBtn')?.addEventListener('click', Wallet.connectWalletConnect);
 
-  byId('enterVaultBtn')?.addEventListener('click', async () => {
-    console.log('[BioVault] Enter Vault clicked');
-    if (isVaultLockedOut()) { UI.showAlert("Vault locked out."); return; }
-    const pin = prompt("Enter passphrase:");
-    const stored = await DB.loadVaultDataFromDB();
-    if (!stored) return;
+byId('enterVaultBtn')?.addEventListener('click', async () => {
+  console.log('[BioVault] Enter Vault clicked');
+  if (isVaultLockedOut()) { UI.showAlert("Vault locked out."); return; }
 
-    derivedKey = await Vault.deriveKeyFromPIN(Utils.sanitizeInput(pin), stored.salt);
-    try {
-      vaultData = await Encryption.decryptData(derivedKey, stored.iv, stored.ciphertext);
-      const ok = await Biometric.performBiometricAssertion(vaultData.credentialId);
-      if (!ok) { await handleFailedAuthAttempt(); return UI.showAlert("Biometric failed."); }
+  const pin = prompt("Enter passphrase:");
+  const stored = await DB.loadVaultDataFromDB();
+  if (!stored) return;
 
-      vaultUnlocked = true;
-      // Immediately show vault UI and hide whitepaper so later errors won't block the visual change
-      revealVaultUI();
+  derivedKey = await Vault.deriveKeyFromPIN(Utils.sanitizeInput(pin || ''), stored.salt);
+  try {
+    vaultData = await Encryption.decryptData(derivedKey, stored.iv, stored.ciphertext);
+
+    const ok = await Biometric.performBiometricAssertion(vaultData.credentialId);
+    if (!ok) { await handleFailedAuthAttempt(); return UI.showAlert("Biometric failed."); }
+
+    // Success
+    vaultUnlocked = true;
+    revealVaultUI();                 // <— force show vault panel + hide whitepaper
+    await Vault.updateBalanceFromSegments();
+    Vault.updateVaultUI();
+
+    // Do NOT generate ZKP here; actions will prompt when needed
+    try { localStorage.setItem(VAULT_UNLOCKED_KEY, 'true'); } catch {}
+  } catch (e) {
+    console.error('[BioVault] Unlock error', e);
+    await handleFailedAuthAttempt();
+    UI.showAlert("Invalid passphrase or corrupted vault.");
+  }
+});
+
 
       // Now update the UI data in the background
       try { await Vault.updateBalanceFromSegments(); } catch (e) { console.warn('[BioVault] updateBalanceFromSegments', e); }
