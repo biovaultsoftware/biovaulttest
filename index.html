@@ -107,7 +107,6 @@
     .navbar-nav .nav-item {
       width: 100%;
     }
- 
     /* Push content down when navbar is expanded */
     .navbar-collapse.collapsing,
     .navbar-collapse.show {
@@ -293,10 +292,9 @@
         <li>Superiority: Unlimited scalability, proactive crime prevention, meets global AML standards.</li>
       </ul>
       <p>Example Use Case: For any currency (e.g., USD, Euro, Riyal), BalanceChain SCL makes every unit traceable—cash or digital—preventing crime and enabling smooth CBDC transition.</p>
-      <a href="#" class="btn btn-secondary w-100" role="button" aria-label="Request SCL Demo"
-         onclick="alert('Contact for full SCL implementation details.')">
+      <button class="btn btn-secondary w-100" type="button" data-bs-toggle="modal" data-bs-target="#modalSCLRequest" aria-label="Request SCL Demo">
         <i class="fas fa-info-circle me-2" aria-hidden="true"></i> Request SCL Demo
-      </a>
+      </button>
     </div>
     <button class="btn btn-outline-light back-btn w-100" type="button" onclick="showSection('landing')">
       <i class="fas fa-arrow-left me-2" aria-hidden="true"></i> Back
@@ -523,6 +521,35 @@
           </button>
         </div>
       </form>
+    </div>
+  </div>
+  <!-- SCL Request Modal -->
+  <div class="modal fade" id="modalSCLRequest" tabindex="-1" aria-labelledby="modalSCLRequestLabel" aria-hidden="true">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="modalSCLRequestLabel">Request SCL Demo</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <p>To request the SCL demo, please send an email to <strong>support@biovault.app</strong> with the following message (edit as needed):</p>
+          <textarea id="emailBody" class="form-control" rows="10">Hi team,
+
+I am interested in the SCL demo. Please contact me with more details.
+
+My name: [Your Name]
+My email: [Your Email]
+My phone: [Your Phone]
+Company/Organization: [Optional]
+
+Best regards,
+[Your Name]</textarea>
+          <button class="btn btn-outline-light mt-3" type="button" onclick="copyToClipboard('emailBody')">Copy Message to Clipboard</button>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Close</button>
+        </div>
+      </div>
     </div>
   </div>
   <!-- 🔼🔼🔼 End modals 🔼🔼🔼 -->
