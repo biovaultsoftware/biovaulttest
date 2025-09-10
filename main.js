@@ -1645,6 +1645,7 @@ const ContractInteractions = {
     }
   },
 
+
   exchangeTVMForSegments: async () => {
     if (!ensureReady() || !tvmContract || typeof tvmContract.exchangeTVMForSegments !== 'function') {
       UI.showAlert('TVM contract not available on this network.'); return;
@@ -1712,7 +1713,11 @@ const ContractInteractions = {
     }
   }
 };
-
+  // Add to init() Event Listeners (after Claim modal open)
+  el = byId('btnAutoClaim');
+  if (el) el.addEventListener('click', async function(){
+    await ContractInteractions.claimTVM(); // Triggers auto-claim with progress
+  });
 // ---------- P2P (modal-integrated) ----------
 const P2P = {
   // Core builder used by modal form — PATCHED to CBOR+varint (v:3)
