@@ -963,19 +963,27 @@ function disableDashboardButtons() {
 // ---------- Wallet ----------
 const Wallet = {
   connectMetaMask: async () => {
-    if (!window.ethereum) { alert('Install MetaMask.'); return; }
-    provider = new ethers.BrowserProvider(window.ethereum);
-    await provider.send('eth_requestAccounts', []);
-    signer = await provider.getSigner();
-    account = await signer.getAddress();
-    chainId = await provider.getNetwork().then(function(net){ return net.chainId; });
-    vaultData.userWallet = account;
-    UI.updateConnectedAccount();
-    await Wallet.initContracts();
-    await Wallet.updateBalances();
-    enableDashboardButtons();
-    const btn = document.getElementById('connect-wallet');
-    if (btn) { btn.textContent = 'Wallet Connected'; btn.disabled = true; }
+    if (typeof window.ethereum === 'undefined') {
+      UI.showAlert('Install MetaMask to continue.');
+      return;
+    }
+    try {
+      provider = new ethers.BrowserProvider(window.ethereum);
+      await provider.send('eth_requestAccounts', []);
+      signer = await provider.getSigner();
+      account = await signer.getAddress();
+      chainId = await provider.getNetwork().then(net => net.chainId);
+      vaultData.userWallet = account;
+      UI.updateConnectedAccount();
+      await Wallet.initContracts();
+      await Wallet.updateBalances();
+      enableDashboardButtons();
+      const btn = document.getElementById('connect-wallet');
+      if (btn) { btn.textContent = 'Wallet Connected'; btn.disabled = true; }
+    } catch (e) {
+      console.error('[BioVault] MetaMask connect failed', e);
+      UI.showAlert('MetaMask connection failed: ' + (e.message || e));
+    }
   },
 
   connectWalletConnect: async () => {
@@ -1874,7 +1882,7 @@ const P2P = {
 };
 
 // New: direct import from a .cbor file
-P2P.importCatchInFile = async function(file){
+P2P.importCatchIn = async function(file){
     if (transactionLock) return UI.showAlert('Another transaction is in progress. Please wait.');
     transactionLock = true;
     try {
