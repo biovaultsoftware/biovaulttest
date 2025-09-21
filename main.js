@@ -1,3 +1,15 @@
+/******************************
+ * main.js - ES2018 compatible (no optional chaining / numeric separators)
+ * Ultimate master-class build: compact+encrypted P2P, network guards, robust charts, safe base64, 0x Bio-IBAN, bonus constant.
+ * UPDATED: Implements clarified rules:
+ *  - On-chain TVM claim uses segments with ownershipChangeCount === 1 (no 10-history on-chain).
+ *  - P2P sends only unlocked segments; after send, auto-unlock equal count if caps allow.
+ *  - Tracks daily/monthly/yearly segment caps (360/3600/10800) and yearly TVM (900 + 100 parity).
+ *
+ * PATCH: P2P payload switched from JSON to CBOR + varint streaming (v:3 envelope),
+ *        with backward-compat import for v:1/v:2.
+ ******************************/
+
 // ---------- Base Setup / Global Constants ----------//
 const DB_NAME = 'BioVaultDB';
 const DB_VERSION = 4; // bumped for new fields
@@ -58,7 +70,12 @@ const AES_KEY_LENGTH = 256;
 const MAX_IDLE = 15 * 60 * 1000;
 const HMAC_KEY = new TextEncoder().encode("BalanceChainHMACSecret");
 const WALLET_CONNECT_PROJECT_ID = 'c4f79cc9f2f73b737d4d06795a48b4a5';
-
+// ---- QR/ZIP/Chart integration constants ----
+const QR_CHUNK_MAX = 900; // safe per-frame payload length for QR (approx, ECC M)
+const QR_SIZE = 512; // px
+const QR_MARGIN = 2; // quiet zone
+var _qrLibReady = false;
+var _zipLibReady = false;
 var _chartLibReady = false;
 // ---------- Derived segment caps (segments, not TVM) ----------
 const DAILY_CAP_SEG = DAILY_CAP_TVM * SEGMENTS_PER_TVM; // 360
@@ -140,57 +157,6 @@ function hashSegmentProof(p) {
       p.biometricZKP
     ]
   );
-}
-// Retry wrapper for dynamic imports (for production reliability)
-async function retryImport(url, maxRetries = 3, delayMs = 1000) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await import(url);
-    } catch (e) {
-      if (attempt === maxRetries) throw e;
-      console.warn(`Import attempt ${attempt} failed: ${e.message}. Retrying...`);
-      await new Promise(resolve => setTimeout(resolve, delayMs * attempt));
-    }
-  }
-}
-
-// Mobile detection (enhanced with feature checks for accuracy in 2025 browsers)
-function isMobile() {
-  const ua = navigator.userAgent;
-  return /Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua) ||
-         (navigator.maxTouchPoints && navigator.maxTouchPoints > 2) ||
-         ('ontouchstart' in window) || window.innerWidth < 768; // Fallback for PWAs
-}
-
-// Wallet deep links (production-ready with common wallets; extend as needed)
-const walletDeepLinks = {
-  metamask: { scheme: 'metamask://wc?uri=', storeAndroid: 'https://play.google.com/store/apps/details?id=io.metamask', storeIOS: 'https://apps.apple.com/app/metamask/id1438144202' },
-  trust: { scheme: 'trust://wc?uri=', storeAndroid: 'https://play.google.com/store/apps/details?id=com.wallet.crypto.trustapp', storeIOS: 'https://apps.apple.com/app/trust-crypto-bitcoin-wallet/id1288339409' },
-  binance: { scheme: 'bnb://wc?uri=', storeAndroid: 'https://play.google.com/store/apps/details?id=com.binance.dev', storeIOS: 'https://apps.apple.com/app/binance/id1436799971' },
-  rainbow: { scheme: 'rainbow://wc?uri=', storeAndroid: 'https://play.google.com/store/apps/details?id=me.rainbow', storeIOS: 'https://apps.apple.com/app/rainbow-ethereum-wallet/id1457119021' },
-  // Add more: e.g., 'coinbase': { scheme: 'cbwallet://wc?uri=', ... }
-};
-
-// Get deep link and store URL based on OS
-function getWalletLink(walletName, wcUri) {
-  const encodedUri = encodeURIComponent(wcUri);
-  const wallet = walletDeepLinks[walletName.toLowerCase()] || { scheme: `wc://wc?uri=${encodedUri}` }; // Generic fallback
-  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
-  const storeUrl = isIOS ? wallet.storeIOS : wallet.storeAndroid;
-  return { deepLink: wallet.scheme + encodedUri, storeUrl: storeUrl || 'https://walletconnect.com/wallets' };
-}
-
-// Deep link with fallback (includes timeout and visibility check for better accuracy)
-function triggerDeepLink(deepLink, storeUrl) {
-  window.location.href = deepLink;
-  const timeoutId = setTimeout(() => {
-    if (!document.hidden) { // If page didn't navigate away, assume wallet not installed
-      window.location.href = storeUrl;
-    }
-  }, 2500); // Slightly longer timeout for slower devices
-  // Cleanup on visibility change (edge case for PWAs)
-  const cleanup = () => { clearTimeout(timeoutId); document.removeEventListener('visibilitychange', cleanup); };
-  document.addEventListener('visibilitychange', cleanup);
 }
 // Merkle root of segment proof hashes (for compact payload)
 function merkleRoot(hashes /* array of 0x..32B */) {
@@ -423,6 +389,7 @@ let __storageCheckTimer = setInterval(function(){
   if (!exists) console.warn('Vault backup missing; consider running backupVault()');
 }, STORAGE_CHECK_INTERVAL);
 // ---------- HIGH-LEVEL FLOWS ----------
+// ---------- HIGH-LEVEL FLOWS YOU CAN CALL ----------
 // 1) TVM Mint flow (one or many segments)
 async function composeAndSendMint({
   segments, // [segmentIndex,...]
@@ -1548,93 +1515,6 @@ const Proofs = {
     }
   }
 };
-// New: Helper to Batch by Layer and Max Proofs
-function batchProofsByLayer(eligibleSegments) {
-  const batches = [];
-  const groups = {}; // group by layer
-  eligibleSegments.forEach(s => {
-    const layer = Math.floor((s.segmentIndex - 1) / SEGMENTS_PER_LAYER) + 1;
-    if (!groups[layer]) groups[layer] = [];
-    groups[layer].push(s);
-  });
-  Object.keys(groups).forEach(layer => {
-    const segs = groups[layer].sort((a, b) => a.segmentIndex - b.segmentIndex);
-    const maxTvmPerBatch = Math.floor(MAX_PROOFS_LENGTH / (SEGMENTS_PER_TVM * layer));
-    for (let i = 0; i < segs.length; i += maxTvmPerBatch * SEGMENTS_PER_TVM) {
-      const batchSegs = segs.slice(i, i + maxTvmPerBatch * SEGMENTS_PER_TVM);
-      batches.push({ layer: parseInt(layer), segments: batchSegs });
-    }
-  });
-  return batches;
-}
-async function addTVMToMetaMask() {
-  if (window.ethereum) {
-    try {
-      const wasAdded = await window.ethereum.request({
-        method: 'wallet_watchAsset',
-        params: {
-          type: 'ERC20',
-          options: {
-            address: 'YOUR_PROXY_ADDRESS_HERE',  // Use the TVM proxy address
-            symbol: 'TVM',
-            decimals: 6,
-            image: 'URL_TO_YOUR_TOKEN_LOGO.png'  // Optional: Host a 128x128 PNG logo
-          }
-        }
-      });
-      if (wasAdded) {
-        console.log('TVM added successfully!');
-      }
-    } catch (error) {
-      console.error('Error adding token:', error);
-    }
-  } else {
-    alert('MetaMask not detected!');
-  }
-}
-// Provider options for WalletConnect (mobile fallback)
-const providerOptions = {
-  walletconnect: {
-    package: WalletConnectProvider,
-    options: {
-      infuraId: 'YOUR_INFURA_PROJECT_ID',  // Optional: Get free from infura.io for RPC fallback
-      rpc: {
-        42161: 'https://arb1.arbitrum.io/rpc'  // Arbitrum One RPC
-      },
-      chainId: 42161  // Arbitrum One
-    }
-  }
-};
-
-// Initialize Web3Modal
-const web3Modal = new Web3Modal({
-  network: 'arbitrum',  // Or custom config
-  cacheProvider: true,  // Remember user's last wallet
-  providerOptions,
-  theme: 'dark'  // Optional: Customize modal look
-});
-
-// Function to connect wallet (call on button click, e.g., "Connect Wallet")
-async function connectWallet() {
-  try {
-    const provider = await web3Modal.connect();  // Shows modal with wallet options
-    const ethersProvider = new ethers.BrowserProvider(provider);
-    const signer = await ethersProvider.getSigner();
-    const address = await signer.getAddress();
-    console.log('Connected wallet:', address);
-
-    // Now interact with your TVM contract via ethers
-    const tvmContract = new ethers.Contract('YOUR_PROXY_ADDRESS', TVM_ABI, signer);
-    // e.g., await tvmContract.balanceOf(address);
-
-    // Handle events (e.g., chain change, disconnect)
-    provider.on('accountsChanged', (accounts) => console.log('Account changed:', accounts[0]));
-    provider.on('chainChanged', () => window.location.reload());
-    provider.on('disconnect', () => console.log('Disconnected'));
-  } catch (error) {
-    console.error('Connection error:', error);
-  }
-}
 // ---------- UI ----------
 const UI = {
   showAlert: (msg) => alert(msg),
@@ -1657,54 +1537,38 @@ const ensureReady = () => {
   return true;
 };
 const ContractInteractions = {
-  claimTVM: async () => {
+  claimTVM: async (tvmToClaim /* optional integer */) => {
     if (!ensureReady() || !tvmContract || typeof tvmContract.claimTVM !== 'function') {
       UI.showAlert('TVM contract not available on this network.'); return;
     }
     UI.showLoading('claim');
     try {
-      // Compute max claimable (eligible /12, cap-limited)
-      const segs = await DB.loadSegmentsFromDB();
-      const eligible = segs.filter(s => s.currentOwner === vaultData.bioIBAN && !s.claimed && Number(s.ownershipChangeCount || 0) === 1);
+      // Determine segments needed (12 per TVM); default 1 TVM
+      const tvmAmount = Math.max(1, parseInt(tvmToClaim || 1, 10));
+      const needSeg = tvmAmount * SEGMENTS_PER_TVM;
+      const prep = await Proofs.prepareClaimBatch(needSeg);
+      if (!prep.proofs || prep.proofs.length !== needSeg) {
+        UI.showAlert('Not enough eligible segments (need ' + needSeg + ' with ownershipChangeCount=1).'); return;
+      }
+      // Yearly TVM cap guard (local mirror, contract is source of truth)
       resetCapsIfNeeded(Date.now());
-      const maxSeg = Math.min(eligible.length, YEARLY_CAP_SEG - vaultData.caps.yearUsedSeg, MONTHLY_CAP_SEG - vaultData.caps.monthUsedSeg, DAILY_CAP_SEG - vaultData.caps.dayUsedSeg);
-      const maxTvm = Math.floor(maxSeg / SEGMENTS_PER_TVM);
-      if (maxTvm === 0) {
-        UI.showAlert('No eligible segments to claim.'); return;
+      if (vaultData.caps.tvmYearlyClaimed + tvmAmount > MAX_YEARLY_TVM_TOTAL) {
+        UI.showAlert('Yearly TVM cap reached locally.'); return;
       }
-      // Show claimable in modal
-      const claimableInfo = document.getElementById('claimableInfo');
-      if (claimableInfo) claimableInfo.textContent = `Claimable: ${maxTvm} TVM (${maxSeg} segments). Proceed?`;
-      // Wait for user confirm (modal already open via button)
-      // Assuming modal is shown; proceed on "Claim TVM" click
-      const batches = batchProofsByLayer(eligible.slice(0, maxSeg));
-      const totalBatches = batches.length;
-      const progress = document.getElementById('claimProgress');
-      const status = document.getElementById('claimStatus');
-      let claimedTvm = 0;
-      for (let i = 0; i < totalBatches; i++) {
-        const batch = batches[i];
-        const needSegBatch = batch.segments.length;
-        const prep = await Proofs.prepareClaimBatch(needSegBatch); // Builds for this batch
-        prep.proofs.forEach(p => p.layer = batch.layer); // Tag for mint (if needed; contract infers from index)
-        if (status) status.textContent = `Batch ${i+1}/${totalBatches}: ${needSegBatch / SEGMENTS_PER_TVM} TVM on Layer ${batch.layer}...`;
-        if (progress) progress.value = ((i / totalBatches) * 100);
-        const overrides = {}; // Gas as before
-        try {
-          const ge = await tvmContract.estimateGas.claimTVM(prep.proofs, prep.signature, prep.deviceKeyHash, prep.userBioConstant, prep.nonce);
-          overrides.gasLimit = withBuffer(ge);
-        } catch (e) {}
-        const tx = await tvmContract.claimTVM(prep.proofs, prep.signature, prep.deviceKeyHash, prep.userBioConstant, prep.nonce, overrides);
-        await tx.wait();
-        await Proofs.markClaimed(prep.used);
-        const batchTvm = needSegBatch / SEGMENTS_PER_TVM;
-        vaultData.caps.tvmYearlyClaimed += batchTvm;
-        claimedTvm += batchTvm;
-      }
-      if (progress) progress.value = 100;
-      if (status) status.textContent = 'Claim complete!';
-      UI.showAlert(`Claim successful: ${claimedTvm} TVM (${maxSeg} segments).`);
+      // Gas estimate
+      var overrides = {};
+      try {
+        var ge = await tvmContract.estimateGas.claimTVM(prep.proofs, prep.signature, prep.deviceKeyHash, prep.userBioConstant, prep.nonce);
+        overrides.gasLimit = withBuffer(ge);
+      } catch (e) { console.warn('estimateGas failed; sending without explicit gasLimit', e); }
+      const tx = await tvmContract.claimTVM(prep.proofs, prep.signature, prep.deviceKeyHash, prep.userBioConstant, prep.nonce, overrides);
+      await tx.wait();
+      // Mark claimed locally and bump yearly TVM counter
+      await Proofs.markClaimed(prep.used);
+      vaultData.caps.tvmYearlyClaimed += tvmAmount;
+      UI.showAlert('Claim successful: ' + tvmAmount + ' TVM (' + needSeg + ' segments).');
       Wallet.updateBalances();
+      // Clear transient autoProofs cache (not used anymore)
       autoProofs = null;
       await persistVaultData();
     } catch (err) {
@@ -1779,11 +1643,6 @@ const ContractInteractions = {
     }
   }
 };
-  // Add to init() Event Listeners (after Claim modal open)
-  el = byId('btnAutoClaim');
-  if (el) el.addEventListener('click', async function(){
-    await ContractInteractions.claimTVM(); // Triggers auto-claim with progress
-  });
 // ---------- P2P (modal-integrated) ----------
 const P2P = {
   // Core builder used by modal form — PATCHED to CBOR+varint (v:3)
@@ -1925,20 +1784,17 @@ P2P.importCatchInFile = async function(file){
     try {
         if (!vaultUnlocked) return UI.showAlert('Vault locked.');
         if (!file) return UI.showAlert('No file selected.');
-
         // Read .cbor as ArrayBuffer → Uint8Array → CBOR.decode
         const buf = await file.arrayBuffer();
-        const u8  = new Uint8Array(buf);
+        const u8 = new Uint8Array(buf);
         const envelope = CBOR.decode(u8);
-
         if (!envelope || !envelope.nonce) return UI.showAlert('Malformed payload file.');
         if (await DB.hasReplayNonce(envelope.nonce)) return UI.showAlert('Duplicate transfer detected (replay).');
         await DB.putReplayNonce(envelope.nonce);
-
         // v3 branch (same path as text import)
         if (envelope.v === 3 && envelope.iv && envelope.ct) {
         const p2pKey = await deriveP2PKey(envelope.from, envelope.to, envelope.nonce);
-        const bytes  = await Encryption.decryptBytes(
+        const bytes = await Encryption.decryptBytes(
             p2pKey,
             Encryption.base64ToBuffer(envelope.iv),
             Encryption.base64ToBuffer(envelope.ct)
@@ -1949,7 +1805,6 @@ P2P.importCatchInFile = async function(file){
         await handleIncomingChains(fromCompactChains(expandedChains), envelope.from, envelope.to);
         return;
         }
-
         // v2/v1 fallbacks not expected for .cbor, but we could add if needed
         return UI.showAlert('Unsupported or malformed payload file.');
     } catch (e) {
@@ -2126,7 +1981,69 @@ async function persistVaultData(saltBuf) {
   }
   await DB.saveVaultDataToDB(iv, ciphertext, saltBase64);
 }
-
+// ---------- Catch-Out Result helpers (QR / ZIP) ----------
+function splitIntoFrames(str, maxLen) {
+  var chunks = [];
+  for (var i=0;i<str.length;i+=maxLen) chunks.push(str.slice(i, i+maxLen));
+  var total = chunks.length;
+  var out = [];
+  for (var j=0;j<total;j++) out.push('BC|' + (j+1) + '|' + total + '|' + chunks[j]);
+  return out;
+}
+function updateQrIndicator() {
+  var ind = document.getElementById('qrIndicator');
+  var nav = document.getElementById('qrNav');
+  if (!ind || !nav) return;
+  if (lastQrFrames.length <= 1) { nav.style.display = 'none'; }
+  else {
+    nav.style.display = 'flex';
+    ind.textContent = (lastQrFrameIndex + 1) + ' / ' + lastQrFrames.length;
+  }
+}
+async function renderQrFrame() {
+  await ensureQrLib();
+  var canvas = document.getElementById('catchOutQRCanvas');
+  if (!canvas || !window.QRCode) return;
+  var text = lastQrFrames[lastQrFrameIndex] || '';
+  try {
+    await window.QRCode.toCanvas(canvas, text, { width: QR_SIZE, margin: QR_MARGIN, errorCorrectionLevel: 'M' });
+  } catch (e) {
+    console.warn('[BioVault] QR render failed', e);
+  }
+  updateQrIndicator();
+}
+async function prepareFramesForPayload(payloadStr) {
+  lastQrFrames = splitIntoFrames(payloadStr, QR_CHUNK_MAX);
+  lastQrFrameIndex = 0;
+  updateQrIndicator();
+}
+async function downloadFramesZip() {
+  await ensureQrLib(); await ensureZipLib();
+  if (!window.JSZip) { UI.showAlert('ZIP library could not load.'); return; }
+  var zip = new window.JSZip();
+  // add payload as CBOR (base64-encoded for portability)
+  zip.file('payload.cbor.b64', lastCatchOutPayloadStr || '');
+  // add manifest
+  zip.file('frames_manifest.json', JSON.stringify({ version:1, total:lastQrFrames.length, size:QR_SIZE, ecLevel:'M', prefix:'BC|i|N|' }, null, 2));
+  // Render each frame to PNG
+  for (var i=0;i<lastQrFrames.length;i++) {
+    var c = document.createElement('canvas');
+    c.width = QR_SIZE; c.height = QR_SIZE;
+    try {
+      await window.QRCode.toCanvas(c, lastQrFrames[i], { width: QR_SIZE, margin: QR_MARGIN, errorCorrectionLevel: 'M' });
+      var dataURL = c.toDataURL('image/png');
+      var base64 = dataURL.split(',')[1];
+      zip.file('qr_' + String(i+1).padStart(3,'0') + '.png', base64, { base64:true });
+    } catch (e) {
+      console.warn('Frame render failed (#'+(i+1)+')', e);
+    }
+  }
+  var blob = await zip.generateAsync({ type:'blob' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = 'catchout_qr_frames.zip'; a.click();
+  URL.revokeObjectURL(url);
+}
 async function showCatchOutResultModal() {
   // Hide the big textarea if present
   const ta = document.getElementById('catchOutResultText');
@@ -2146,7 +2063,8 @@ async function showCatchOutResultModal() {
       }
     };
   }
-
+  // Prepare QR frames from the cached base64 (fallback/offline)
+  if (lastCatchOutPayloadStr) await prepareFramesForPayload(lastCatchOutPayloadStr);
   // Show the modal
   const modalEl = document.getElementById('modalCatchOutResult');
   if (modalEl) {
@@ -2154,7 +2072,6 @@ async function showCatchOutResultModal() {
     if (m) m.show(); else modalEl.style.display = 'block';
   }
 }
-
 // ---------- Migrations (production-grade safety) ----------
 async function migrateSegmentsV4() {
   const segs = await DB.loadSegmentsFromDB();
