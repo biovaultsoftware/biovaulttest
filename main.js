@@ -1,15 +1,3 @@
-/******************************
- * main.js - ES2018 compatible (no optional chaining / numeric separators)
- * Ultimate master-class build: compact+encrypted P2P, network guards, robust charts, safe base64, 0x Bio-IBAN, bonus constant.
- * UPDATED: Implements clarified rules:
- * - On-chain TVM claim uses segments with ownershipChangeCount === 1 (no 10-history on-chain).
- * - P2P sends only unlocked segments; after send, auto-unlock equal count if caps allow.
- * - Tracks daily/monthly/yearly segment caps (360/3600/10800) and yearly TVM (900 + 100 parity).
- *
- * PATCH: P2P payload switched from JSON to CBOR + varint streaming (v:3 envelope),
- * with backward-compat import for v:1/v:2.
- ******************************/
-
 // ---------- Base Setup / Global Constants ----------//
 const DB_NAME = 'BioVaultDB';
 const DB_VERSION = 4; // bumped for new fields
@@ -23,8 +11,8 @@ const LOCKOUT_DURATION_SECONDS = 3600;
 const MAX_AUTH_ATTEMPTS = 3;
 
 // IMPORTANT: lowercase to bypass strict checksum validation in ethers v6
-const CONTRACT_ADDRESS = '0xcc79b1bc9eabc3d30a3800f4d41a4a0599e1f3c6';
-const USDT_ADDRESS     = '0xdac17f958d2ee523a2206206994597c13d831ec7';
+const CONTRACT_ADDRESS = '0xf15D7981dD2031cAe8Bb5f58513Ae38b3D7a2b34';
+const USDT_ADDRESS     = '0x81CdB7FCF129B35Cb36c0331Db9664381B9254c9';
 
 // expected network for your deployment (change if not mainnet)
 const EXPECTED_CHAIN_ID = 42161;
@@ -52,7 +40,6 @@ const ABI = [
   {"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
   {"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"spender","type":"address"}],"name":"allowance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
 ];
-
 const GENESIS_BIO_CONSTANT = 1736565605;
 const BIO_STEP = 1;
 const SEGMENTS_PER_LAYER = 1200;
@@ -73,12 +60,10 @@ const HMAC_KEY = new TextEncoder().encode("BalanceChainHMACSecret");
 const WALLET_CONNECT_PROJECT_ID = 'c4f79cc9f2f73b737d4d06795a48b4a5';
 
 var _chartLibReady = false;
-
 // ---------- Derived segment caps (segments, not TVM) ----------
-const DAILY_CAP_SEG  = DAILY_CAP_TVM  * SEGMENTS_PER_TVM; // 360
+const DAILY_CAP_SEG = DAILY_CAP_TVM * SEGMENTS_PER_TVM; // 360
 const MONTHLY_CAP_SEG= MONTHLY_CAP_TVM* SEGMENTS_PER_TVM; // 3600
 const YEARLY_CAP_SEG = YEARLY_CAP_TVM * SEGMENTS_PER_TVM; // 10800
-
 // ---------- State ----------
 let vaultUnlocked = false;
 let derivedKey = null;
@@ -93,12 +78,10 @@ let lastCatchOutPayload = null;
 // New: keep the raw CBOR bytes and a default filename for re-download
 var lastCatchOutPayloadBytes = null;
 var lastCatchOutFileName = "";
-
 const SESSION_URL_KEY = 'last_session_url';
 const VAULT_UNLOCKED_KEY = 'vaultUnlocked';
 const VAULT_LOCK_KEY = 'vaultLock';
 const VAULT_BACKUP_KEY = 'vault.backup';
-
 // ---------- CONSTANTS (all used below) ----------
 const BIO_TOLERANCE = 720; // seconds: biometric freshness window
 const DECIMALS_FACTOR = 1000000;
@@ -115,17 +98,14 @@ const CLAIM_TYPEHASH = ethers.keccak256(
 );
 const STORAGE_CHECK_INTERVAL = 300000; // 5 min
 const vaultSyncChannel = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('vault-sync') : null;
-
 // ---------- AUTO (now actually used) ----------
 let autoProofs = null;
 let autoDeviceKeyHash = ''; // bytes32 hex
 let autoUserBioConstant = 0;
 let autoNonce = 0;
 let autoSignature = '';
-
 // ---------- UTIL ----------
 const coder = ethers.AbiCoder.defaultAbiCoder();
-
 function toBaseUnits(xHuman) {
   return Math.floor(Number(xHuman) * DECIMALS_FACTOR);
 }
@@ -133,11 +113,9 @@ function fromBaseUnits(xBase) {
   return Number(xBase) / DECIMALS_FACTOR;
 }
 function nowSec() { return Math.floor(Date.now() / 1000); }
-
 function keccakPacked(types, values) {
   return ethers.keccak256(coder.encode(types, values));
 }
-
 // Compute hash of a SegmentProof as the on-chain contract would (EIP-712-style struct hash)
 function hashSegmentProof(p) {
   return keccakPacked(
@@ -163,7 +141,57 @@ function hashSegmentProof(p) {
     ]
   );
 }
+// Retry wrapper for dynamic imports (for production reliability)
+async function retryImport(url, maxRetries = 3, delayMs = 1000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await import(url);
+    } catch (e) {
+      if (attempt === maxRetries) throw e;
+      console.warn(`Import attempt ${attempt} failed: ${e.message}. Retrying...`);
+      await new Promise(resolve => setTimeout(resolve, delayMs * attempt));
+    }
+  }
+}
 
+// Mobile detection (enhanced with feature checks for accuracy in 2025 browsers)
+function isMobile() {
+  const ua = navigator.userAgent;
+  return /Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua) ||
+         (navigator.maxTouchPoints && navigator.maxTouchPoints > 2) ||
+         ('ontouchstart' in window) || window.innerWidth < 768; // Fallback for PWAs
+}
+
+// Wallet deep links (production-ready with common wallets; extend as needed)
+const walletDeepLinks = {
+  metamask: { scheme: 'metamask://wc?uri=', storeAndroid: 'https://play.google.com/store/apps/details?id=io.metamask', storeIOS: 'https://apps.apple.com/app/metamask/id1438144202' },
+  trust: { scheme: 'trust://wc?uri=', storeAndroid: 'https://play.google.com/store/apps/details?id=com.wallet.crypto.trustapp', storeIOS: 'https://apps.apple.com/app/trust-crypto-bitcoin-wallet/id1288339409' },
+  binance: { scheme: 'bnb://wc?uri=', storeAndroid: 'https://play.google.com/store/apps/details?id=com.binance.dev', storeIOS: 'https://apps.apple.com/app/binance/id1436799971' },
+  rainbow: { scheme: 'rainbow://wc?uri=', storeAndroid: 'https://play.google.com/store/apps/details?id=me.rainbow', storeIOS: 'https://apps.apple.com/app/rainbow-ethereum-wallet/id1457119021' },
+  // Add more: e.g., 'coinbase': { scheme: 'cbwallet://wc?uri=', ... }
+};
+
+// Get deep link and store URL based on OS
+function getWalletLink(walletName, wcUri) {
+  const encodedUri = encodeURIComponent(wcUri);
+  const wallet = walletDeepLinks[walletName.toLowerCase()] || { scheme: `wc://wc?uri=${encodedUri}` }; // Generic fallback
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const storeUrl = isIOS ? wallet.storeIOS : wallet.storeAndroid;
+  return { deepLink: wallet.scheme + encodedUri, storeUrl: storeUrl || 'https://walletconnect.com/wallets' };
+}
+
+// Deep link with fallback (includes timeout and visibility check for better accuracy)
+function triggerDeepLink(deepLink, storeUrl) {
+  window.location.href = deepLink;
+  const timeoutId = setTimeout(() => {
+    if (!document.hidden) { // If page didn't navigate away, assume wallet not installed
+      window.location.href = storeUrl;
+    }
+  }, 2500); // Slightly longer timeout for slower devices
+  // Cleanup on visibility change (edge case for PWAs)
+  const cleanup = () => { clearTimeout(timeoutId); document.removeEventListener('visibilitychange', cleanup); };
+  document.addEventListener('visibilitychange', cleanup);
+}
 // Merkle root of segment proof hashes (for compact payload)
 function merkleRoot(hashes /* array of 0x..32B */) {
   if (!hashes.length) return ethers.ZeroHash;
@@ -179,7 +207,6 @@ function merkleRoot(hashes /* array of 0x..32B */) {
   }
   return layer[0];
 }
-
 // Segment index bitmap compression (compact segment set)
 function segmentBitmap(indices){
   if (!indices || indices.length === 0) return '0x';
@@ -191,15 +218,12 @@ function segmentBitmap(indices){
   }
   return ethers.hexlify(bytes);
 }
-
-
 // Biometric recency / tolerance gate
 function checkBioFreshness(ts /* seconds */) {
   if (Math.abs(nowSec() - ts) > BIO_TOLERANCE) {
     throw new Error('Biometric proof outside tolerance window of ' + BIO_TOLERANCE + 's');
   }
 }
-
 // AES-GCM envelope keyed for the receiver (compact & private)
 async function encryptForReceiver(receiverDeviceKeyHashHex, bytes) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -399,7 +423,6 @@ let __storageCheckTimer = setInterval(function(){
   if (!exists) console.warn('Vault backup missing; consider running backupVault()');
 }, STORAGE_CHECK_INTERVAL);
 // ---------- HIGH-LEVEL FLOWS ----------
-// ---------- HIGH-LEVEL FLOWS YOU CAN CALL ----------
 // 1) TVM Mint flow (one or many segments)
 async function composeAndSendMint({
   segments, // [segmentIndex,...]
@@ -902,45 +925,125 @@ function disableDashboardButtons() {
   var ids = ['claim-tvm-btn','exchange-tvm-btn','swap-tvm-usdt-btn','swap-usdt-tvm-btn'];
   for (var i=0;i<ids.length;i++){ var b=document.getElementById(ids[i]); if (b) b.disabled = true; }
 }
+const ARBITRUM_ONE_PARAMS = {
+  chainId: '0xA4B1', // Hex for 42161
+  chainName: 'Arbitrum One',
+  nativeCurrency: {
+    name: 'Ethereum',
+    symbol: 'ETH',
+    decimals: 18
+  },
+  rpcUrls: ['https://arb1.arbitrum.io/rpc'],
+  blockExplorerUrls: ['https://arbiscan.io']
+};
+
 // ---------- Wallet ----------
 const Wallet = {
   connectMetaMask: async () => {
-    if (typeof window.ethereum === 'undefined') {
-      UI.showAlert('Install MetaMask to continue.');
-      return;
+    if (!window.ethereum) { alert('Install MetaMask.'); return; }
+    provider = new ethers.BrowserProvider(window.ethereum);
+    await provider.send('eth_requestAccounts', []);
+    signer = await provider.getSigner();
+    account = await signer.getAddress();
+    chainId = (await provider.getNetwork()).chainId;
+
+    // Check and switch chain if not matching
+    if (Number(chainId) !== EXPECTED_CHAIN_ID) {
+      try {
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: '0x' + EXPECTED_CHAIN_ID.toString(16) }]
+        });
+        // Refresh chainId after switch
+        chainId = (await provider.getNetwork()).chainId;
+      } catch (switchError) {
+        // If chain not added (error code 4902), add it
+        if (switchError.code === 4902) {
+          try {
+            await window.ethereum.request({
+              method: 'wallet_addEthereumChain',
+              params: [ARBITRUM_ONE_PARAMS]
+            });
+            // Switch after adding
+            await window.ethereum.request({
+              method: 'wallet_switchEthereumChain',
+              params: [{ chainId: '0x' + EXPECTED_CHAIN_ID.toString(16) }]
+            });
+            chainId = (await provider.getNetwork()).chainId;
+          } catch (addError) {
+            console.error('[BioVault] Chain add failed', addError);
+            UI.showAlert('Failed to add/switch to Arbitrum One. Please add it manually in your wallet.');
+            return;
+          }
+        } else {
+          console.error('[BioVault] Chain switch failed', switchError);
+          UI.showAlert('Failed to switch to Arbitrum One. Please switch manually in your wallet.');
+          return;
+        }
+      }
     }
-    try {
-      provider = new ethers.BrowserProvider(window.ethereum);
-      await provider.send('eth_requestAccounts', []);
-      signer = await provider.getSigner();
-      account = await signer.getAddress();
-      chainId = await provider.getNetwork().then(net => net.chainId);
-      vaultData.userWallet = account;
-      UI.updateConnectedAccount();
-      await Wallet.initContracts();
-      await Wallet.updateBalances();
-      enableDashboardButtons();
-      const btn = document.getElementById('connect-wallet');
-      if (btn) { btn.textContent = 'Wallet Connected'; btn.disabled = true; }
-    } catch (e) {
-      console.error('[BioVault] MetaMask connect failed', e);
-      UI.showAlert('MetaMask connection failed: ' + (e.message || e));
-    }
+
+    vaultData.userWallet = account;
+    UI.updateConnectedAccount();
+    await Wallet.initContracts();
+    await Wallet.updateBalances();
+    enableDashboardButtons();
+    const btn = document.getElementById('connect-wallet');
+    if (btn) { btn.textContent = 'Wallet Connected'; btn.disabled = true; }
   },
   connectWalletConnect: async () => {
     let WCProvider;
     try {
-      WCProvider = await import('https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.14.0/dist/esm/index.js');
+      WCProvider = await import('https://cdn.jsdelivr.net/npm/@walletconnect/ethereum-provider@2.21.8/dist/esm/index.js');
     } catch (e) {
       UI.showAlert('Could not load WalletConnect (offline or blocked). Try MetaMask.');
       return;
     }
-    const wcProvider = await WCProvider.EthereumProvider.init({ projectId: WALLET_CONNECT_PROJECT_ID, chains:[EXPECTED_CHAIN_ID], showQrModal:true });
+    const wcProvider = await WCProvider.EthereumProvider.init({
+      projectId: WALLET_CONNECT_PROJECT_ID,
+      chains: [EXPECTED_CHAIN_ID],
+      optionalChains: [1, 10, 137],
+      showQrModal: true
+    });
     await wcProvider.enable();
     provider = new ethers.BrowserProvider(wcProvider);
     signer = await provider.getSigner();
     account = await signer.getAddress();
-    chainId = await provider.getNetwork().then(function(net){ return net.chainId; });
+    chainId = (await provider.getNetwork()).chainId;
+
+    // Check and switch chain if not matching
+    if (Number(chainId) !== EXPECTED_CHAIN_ID) {
+      try {
+        await wcProvider.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: '0x' + EXPECTED_CHAIN_ID.toString(16) }]
+        });
+        chainId = (await provider.getNetwork()).chainId;
+      } catch (switchError) {
+        if (switchError.code === 4902) {
+          try {
+            await wcProvider.request({
+              method: 'wallet_addEthereumChain',
+              params: [ARBITRUM_ONE_PARAMS]
+            });
+            await wcProvider.request({
+              method: 'wallet_switchEthereumChain',
+              params: [{ chainId: '0x' + EXPECTED_CHAIN_ID.toString(16) }]
+            });
+            chainId = (await provider.getNetwork()).chainId;
+          } catch (addError) {
+            console.error('[BioVault] Chain add failed', addError);
+            UI.showAlert('Failed to add/switch to Arbitrum One. Please add it manually in your wallet.');
+            return;
+          }
+        } else {
+          console.error('[BioVault] Chain switch failed', switchError);
+          UI.showAlert('Failed to switch to Arbitrum One. Please switch manually in your wallet.');
+          return;
+        }
+      }
+    }
+
     vaultData.userWallet = account;
     UI.updateConnectedAccount();
     await Wallet.initContracts();
@@ -981,19 +1084,15 @@ const Wallet = {
       // placeholders
       var ub = document.getElementById('user-balance'); if (ub) ub.textContent = '— TVM';
       var uu = document.getElementById('usdt-balance'); if (uu) uu.textContent = '— USDT';
-
       const tvmOk = await contractExists(CONTRACT_ADDRESS.toLowerCase());
       const usdtOk = await contractExists(USDT_ADDRESS.toLowerCase());
       if (!tvmOk || !usdtOk || !tvmContract || !usdtContract) return;
-
       const tvmBal = await tvmContract.balanceOf(account);
       if (ub) ub.textContent = ethers.formatUnits(tvmBal, 18) + ' TVM';
-
       const usdtBal = await usdtContract.balanceOf(account);
       if (uu) uu.textContent = ethers.formatUnits(usdtBal, 6) + ' USDT';
-
-      var e3 = document.getElementById('tvm-price');    if (e3) e3.textContent  = '1.00 USDT';
-      var e4 = document.getElementById('pool-ratio');   if (e4) e4.textContent = '51% HI / 49% AI';
+      var e3 = document.getElementById('tvm-price'); if (e3) e3.textContent = '1.00 USDT';
+      var e4 = document.getElementById('pool-ratio'); if (e4) e4.textContent = '51% HI / 49% AI';
       var e5 = document.getElementById('avg-reserves'); if (e5) e5.textContent = '100M TVM';
     } catch (e) {
       console.warn('Balance refresh failed:', e);
@@ -1009,7 +1108,7 @@ const Wallet = {
   },
   getOnchainBalances: async () => {
     if (!tvmContract || !usdtContract || !account) throw new Error('Connect wallet first.');
-    const tvm  = await tvmContract.balanceOf(account);
+    const tvm = await tvmContract.balanceOf(account);
     const usdt = await usdtContract.balanceOf(account);
     return { tvm: tvm, usdt: usdt };
   }
@@ -1137,8 +1236,7 @@ function fromCompactChains(comp) {
   return out;
 }
 // ---------- CBOR + Varint Streaming (for P2P payloads) ----------
-// Minimal CBOR implementation (subset): unsigned/signed ints, byte strings, text, arrays, maps, bool, null.
-// Only what we need for wrapping our binary stream as {c: <bstr>, t: <int>, n: <text?>}.
+// Minimal CBOR implementation (subset): unsigned/signed ints, byte strings, byte extract, arrays, maps, bool, null.
 const CBOR = (function(){
   function encodeItem(x, out){
     if (x === null){ out.push(0xf6); return; }
@@ -1204,7 +1302,7 @@ const CBOR = (function(){
     if (major===1){ const u=readUint(view, offObj, addl); return -(u+1); }
     if (major===2){
       const len = readUint(view, offObj, addl);
-      const out = view.subarray(offObj.o, off.o+len);
+      const out = view.subarray(offObj.o, offObj.o+len);
       offObj.o += len; return new Uint8Array(out);
     }
     if (major===3){
@@ -1435,7 +1533,6 @@ const Proofs = {
     const signature = await signer.signTypedData(domain, types, value);
     return { proofs, signature, deviceKeyHash, userBioConstant, nonce, used: chosen };
   },
- 
   // After on-chain success, mark segments as claimed
   markClaimed: async (segmentsUsed) => {
     for (let i=0;i<segmentsUsed.length;i++){
@@ -1469,6 +1566,74 @@ function batchProofsByLayer(eligibleSegments) {
     }
   });
   return batches;
+}
+async function addTVMToMetaMask() {
+  if (window.ethereum) {
+    try {
+      const wasAdded = await window.ethereum.request({
+        method: 'wallet_watchAsset',
+        params: {
+          type: 'ERC20',
+          options: {
+            address: 'YOUR_PROXY_ADDRESS_HERE',  // Use the TVM proxy address
+            symbol: 'TVM',
+            decimals: 6,
+            image: 'URL_TO_YOUR_TOKEN_LOGO.png'  // Optional: Host a 128x128 PNG logo
+          }
+        }
+      });
+      if (wasAdded) {
+        console.log('TVM added successfully!');
+      }
+    } catch (error) {
+      console.error('Error adding token:', error);
+    }
+  } else {
+    alert('MetaMask not detected!');
+  }
+}
+// Provider options for WalletConnect (mobile fallback)
+const providerOptions = {
+  walletconnect: {
+    package: WalletConnectProvider,
+    options: {
+      infuraId: 'YOUR_INFURA_PROJECT_ID',  // Optional: Get free from infura.io for RPC fallback
+      rpc: {
+        42161: 'https://arb1.arbitrum.io/rpc'  // Arbitrum One RPC
+      },
+      chainId: 42161  // Arbitrum One
+    }
+  }
+};
+
+// Initialize Web3Modal
+const web3Modal = new Web3Modal({
+  network: 'arbitrum',  // Or custom config
+  cacheProvider: true,  // Remember user's last wallet
+  providerOptions,
+  theme: 'dark'  // Optional: Customize modal look
+});
+
+// Function to connect wallet (call on button click, e.g., "Connect Wallet")
+async function connectWallet() {
+  try {
+    const provider = await web3Modal.connect();  // Shows modal with wallet options
+    const ethersProvider = new ethers.BrowserProvider(provider);
+    const signer = await ethersProvider.getSigner();
+    const address = await signer.getAddress();
+    console.log('Connected wallet:', address);
+
+    // Now interact with your TVM contract via ethers
+    const tvmContract = new ethers.Contract('YOUR_PROXY_ADDRESS', TVM_ABI, signer);
+    // e.g., await tvmContract.balanceOf(address);
+
+    // Handle events (e.g., chain change, disconnect)
+    provider.on('accountsChanged', (accounts) => console.log('Account changed:', accounts[0]));
+    provider.on('chainChanged', () => window.location.reload());
+    provider.on('disconnect', () => console.log('Disconnected'));
+  } catch (error) {
+    console.error('Connection error:', error);
+  }
 }
 // ---------- UI ----------
 const UI = {
@@ -1961,6 +2126,35 @@ async function persistVaultData(saltBuf) {
   }
   await DB.saveVaultDataToDB(iv, ciphertext, saltBase64);
 }
+
+async function showCatchOutResultModal() {
+  // Hide the big textarea if present
+  const ta = document.getElementById('catchOutResultText');
+  if (ta) {
+    ta.value = '';
+    ta.closest('.form-group, .mb-3, .input-group')?.classList?.add('d-none');
+  }
+  // If there’s a "Download .cbor" button, wire it up
+  const btnDownload = document.getElementById('btnDownloadCbor');
+  if (btnDownload) {
+    btnDownload.classList.remove('d-none');
+    btnDownload.onclick = () => {
+      if (lastCatchOutPayloadBytes && lastCatchOutPayloadBytes.length) {
+        downloadBytes(lastCatchOutFileName || 'catchout.cbor', lastCatchOutPayloadBytes, 'application/cbor');
+      } else {
+        UI.showAlert('No payload to download.');
+      }
+    };
+  }
+
+  // Show the modal
+  const modalEl = document.getElementById('modalCatchOutResult');
+  if (modalEl) {
+    const m = window.bootstrap ? new bootstrap.Modal(modalEl) : null;
+    if (m) m.show(); else modalEl.style.display = 'block';
+  }
+}
+
 // ---------- Migrations (production-grade safety) ----------
 async function migrateSegmentsV4() {
   const segs = await DB.loadSegmentsFromDB();
@@ -2070,7 +2264,7 @@ async function init() {
   // Vault Enter / Lock
   el = byId('enterVaultBtn'); if (el) el.addEventListener('click', async function(){
     console.log('[BioVault] Enter Vault clicked');
-    if (isVaultLockedOut()) { UI.showAlert("Vault locked out."); return; }
+    if (isVaultLockedOut()) { UI.showAlert("Vault locked locked out."); return; }
     const pin = prompt("Enter passphrase:");
     const stored = await DB.loadVaultDataFromDB();
     if (!stored) return;
@@ -2186,7 +2380,7 @@ async function init() {
     var sp = byId('spImportCatchIn'); if (sp) sp.classList.remove('d-none');
     var btn = byId('btnImportCatchIn'); if (btn) btn.disabled = true;
     try {
-      await P2P.importCatchIn(ta.value || '');
+      await P2P.importCatchIn((ta&&ta.value) || '');
       if (window.bootstrap) {
         var m2 = bootstrap.Modal.getInstance(document.getElementById('modalCatchIn'));
         if (m2) m2.hide();
